@@ -15,6 +15,14 @@ rather than writing from scratch).
 - **Write a local `metrics.csv` unconditionally**, whenever the facade is enabled — this mirrors what
   Lightning's `CSVLogger` guarantees (metric history survives regardless of W&B connectivity). Don't make
   this conditional on W&B being active; it should always happen.
+- **Write into the same unified per-run output folder convention** the Lightning-based sibling repos use
+  (see `infra-checklist.md`'s Output-folder convention) — `metrics.csv` and any saved preview images should
+  land under the current run's own output directory, not a shared/fixed location, so a debug run's output
+  doesn't collide with or get overwritten by the next one.
+- **Interpolate the W&B project name from dataset+task**, mirroring the reference repos' convention (see
+  `lightning-porting.md`'s step 5), rather than hardcoding a single fixed project string — this keeps the
+  hand-rolled facade's W&B organization consistent with the Lightning-based repos even though the
+  implementation differs.
 - **Fan out to `wandb.log()`/`wandb.Image()` optionally**, gated on a config toggle. Mirror the *same*
   `logger=wandb|csv` config-group selection convention the Lightning-based sibling repos already expose
   (see `lightning-porting.md`'s step 5), even though the implementation underneath is necessarily

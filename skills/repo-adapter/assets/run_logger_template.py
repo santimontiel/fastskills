@@ -50,6 +50,10 @@ class RunLogger:
     """
 
     def __init__(self, cfg: DictConfig, log_dir: str, run_name: str, enabled: bool = True):
+        # `log_dir` is expected to already BE the current run's unified output directory (config
+        # snapshot + train log + checkpoints + this facade's metrics.csv all together) -- see
+        # references/infra-checklist.md's Output-folder convention. Don't point this at a
+        # shared/fixed path across runs.
         self.enabled = enabled
         self.log_dir = Path(log_dir)
         self.csv_path = self.log_dir / "metrics.csv"
@@ -76,6 +80,11 @@ class RunLogger:
 
                 self._wandb = wandb
                 self._wandb.init(
+                    # prefer an interpolated project name built from dataset+task (mirroring the
+                    # Lightning-based reference repos' convention -- see
+                    # references/lightning-porting.md step 5) over a single fixed string, so
+                    # the config passed in should already resolve "<PROJECT_NAME>" to something
+                    # like "<pkg>_<dataset>_<task>" before it reaches here.
                     project=logger_cfg.get("project", "<PROJECT_NAME>"),
                     entity=logger_cfg.get("entity", None),
                     name=run_name,

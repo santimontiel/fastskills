@@ -1,9 +1,20 @@
 # Verification
 
-No test suite exists anywhere in this ecosystem — every adaptation in this family (`fiery-radar`,
-`powerbev-radar`, and the hand-rolled-loop case this skill generalizes from) has been verified by actually
-running the code, staged from cheap/fast checks up to the real thing. "Ran once, no crash" is not the bar
-— see the acceptance test below.
+No test suite exists anywhere in this ecosystem, by design — not an oversight to fix. tinycar-dev itself
+has no `tests/` directory and no lint/CI config; correctness comes entirely from running real
+train/eval/inference scripts on real or debug data, plus two lighter-weight tools worth replicating in
+every ported repo rather than retrofitting a pytest suite that doesn't match how this ecosystem actually
+verifies itself:
+- **`debug_*.py` sanity scripts** — small, standalone scripts that exercise one specific piece in isolation
+  (a backbone's output shape, a normalization-layer mismatch, an encoder swap) without running a full
+  training job.
+- **A dependency-light, framework-free post-hoc run analyzer** — a tool that inspects a completed run's
+  config snapshot, logs, checkpoints, and metrics history without importing `torch` or the training stack
+  at all, so it stays fast and has no risk of dependency conflicts with the environment being analyzed.
+
+Every adaptation in this family (`fiery-radar`, `powerbev-radar`, `JustDepth`, and the hand-rolled-loop case
+this skill originally generalized from) has been verified this way — staged from cheap/fast checks up to
+the real thing. "Ran once, no crash" is not the bar — see the acceptance test below.
 
 ## Staged checklist
 
@@ -39,19 +50,30 @@ running the code, staged from cheap/fast checks up to the real thing. "Ran once,
    checkpoint while the loop keeps running and printing plausible-looking (but garbage) numbers.
 7. **Checkpoint save → reload → real eval run against that checkpoint** — closes the full
    train→checkpoint→eval loop with real numbers, not just "the training script ran."
-8. **Compare the resulting metrics against a known baseline.** This is the actual acceptance bar, not step
-   5 or 6 or 7 in isolation — a clean one-epoch run with sane-looking, non-NaN numbers is *necessary but
-   not sufficient*. The bar is matching order of magnitude (or the expected directional trend after one
-   epoch, for metrics that need full training to converge) against a real reference number. If no baseline
-   was already lined up during Before You Start, get one now from the user or the original repo's author
-   before declaring the adaptation verified — don't substitute "the numbers look plausible" for an actual
-   comparison point.
+8. **Compare the resulting metrics against a known baseline — this is the fidelity gate, not an optional
+   nice-to-have.** This is the actual acceptance bar, not step 5 or 6 or 7 in isolation — a clean one-epoch
+   run with sane-looking, non-NaN numbers is *necessary but not sufficient*. The bar is matching order of
+   magnitude (or the expected directional trend after one epoch, for metrics that need full training to
+   converge) against a real reference number. If no baseline was already lined up during Before You Start,
+   get one now from the user or the original repo's author before declaring the adaptation verified — don't
+   substitute "the numbers look plausible" for an actual comparison point. This is where `SKILL.md`'s
+   fidelity-over-idiom principle actually gets enforced: a port that reads cleaner than the original but
+   fails this comparison has not succeeded, no matter how the code looks.
 
 ## Tooling caution
 
-Before running any repo-scaffolding CLI tool with untested flags against a real target repo, verify its
-actual argument-parsing behavior first — read its source, or test it in a scratch directory. Concrete
-cited failure mode from a real session: a scaffolding tool didn't recognize `--help`/`-h` as real flags at
-all, and instead silently treated them as a literal project-name argument, scaffolding two full template
-directories directly into the target repo's root. Always run `git status` after any exploratory tool
-invocation to catch this kind of surprise untracked output before it's mistaken for something intentional.
+Before running any repo-scaffolding CLI tool with untested flags against a real target repo (including
+`faststart` — see `infra-checklist.md`), verify its actual argument-parsing behavior first — read its
+source, or test it in a scratch directory. Concrete cited failure mode from a real session: a scaffolding
+tool didn't recognize `--help`/`-h` as real flags at all, and instead silently treated them as a literal
+project-name argument, scaffolding two full template directories directly into the target repo's root.
+Always run `git status` after any exploratory tool invocation to catch this kind of surprise untracked
+output before it's mistaken for something intentional.
+
+## Log what you find
+
+Any gotcha discovered during verification that isn't already covered by these reference docs — a new
+numeric-instability pattern, a dataset-specific memory issue, a scaffolding-tool surprise — belongs in
+`references/case-studies.md` as part of `SKILL.md`'s Self-Improve workflow step, not just in the
+conversation it was found in. That's the difference between this skill staying static and it actually
+getting better with each real adaptation.

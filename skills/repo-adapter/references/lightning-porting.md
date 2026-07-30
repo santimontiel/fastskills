@@ -1,8 +1,8 @@
 # Porting a hand-rolled loop to PyTorch Lightning
 
-This is the reference-repo-parity path: every known reference repo (`tinycar-dev`, `gaussiancar`,
-`gcarpred-dev`, `fiery-radar`, `powerbev-radar`) is actually Lightning-based, so a target repo with a
-hand-rolled `torch.distributed` loop permanently diverges from all of them unless this port happens. It is
+This is the reference-repo-parity path: tinycar-dev and every migrated sibling repo (`fiery-radar`,
+`powerbev-radar`, `JustDepth`) are actually Lightning-based, so a target repo with a hand-rolled
+`torch.distributed` loop permanently diverges from the reference shape unless this port happens. It is
 also the only way to get the *real* thing when the user wants "the same logger as the reference repo" —
 Lightning's multi-logger fan-out (`WandbLogger` + `CSVLogger`) is a Lightning feature, not something a
 hand-rolled facade can fully replicate (see `logging-facade.md` for the compensating alternative when this
@@ -12,12 +12,22 @@ port is out of scope).
 code — loss computation, optimizer/scheduler setup, checkpoint save/load, DDP launch, dataloader wiring —
 and is materially bigger and riskier than keeping the loop and adding a facade. Don't default into it.
 
-## Concrete porting pattern
+## The model.py / module.py split
 
-The worked pattern below mirrors `tinycar-dev`'s actual `TinyCaRModule`
-(`tinycar/modeling/module.py`) — read the *target* reference repo's real equivalent file too, since
-details (metric handling, loss-weighting scheme) vary, but the overall shape below is stable across the
-Lightning-based sibling repos.
+The worked pattern below mirrors tinycar-dev's actual split between `modeling/model.py`
+(`TinyCaR` — pure `nn.Module` forward wiring, no training-loop concerns at all: it just defines how a
+batch flows through the network's components) and `modeling/module.py` (`TinyCaRModule` — the
+`LightningModule` that *wraps* the model and owns everything training-loop-specific: loss computation,
+metric logging, optimizer/scheduler config, checkpoint hooks). Keep this split when porting rather than
+collapsing training-loop logic into the same class as the forward pass — it keeps the model importable and
+testable independent of Lightning, and matches every Lightning-based sibling repo's actual shape. Read the
+*target* reference repo's real equivalent files too, since details (metric handling, loss-weighting scheme)
+vary, but this two-file split is stable across the Lightning-based sibling repos.
+
+Architectural sub-blocks (encoders, decoders, fusers, heads) belong in a `modeling/components/` subpackage,
+grouped by role — e.g. interchangeable backbones as `*_encoders/` subpackages selected via Hydra
+(`module/image_encoder=...`), each with an `__init__.py` re-exporting its public classes so `_target_`
+paths stay short and swapping one backbone for another is a one-line config change, not a code change.
 
 **1. Wrap the model in a `LightningModule`:**
 
@@ -136,7 +146,9 @@ these go stale silently otherwise, since nothing errors, the commands just launc
 # configs/logger/wandb.yaml
 # @package loggers
 - _target_: lightning.pytorch.loggers.wandb.WandbLogger
-  project: "<pkg>_${data.name}"
+  # interpolated, not hardcoded — the wandb project should track which dataset+task the run
+  # actually is, without needing to hand-edit this string per task variant
+  project: "<pkg>_${data.model_config.dataset_name}_${task.key}"
   name: "${run_id}"
   save_dir: "${hydra:runtime.output_dir}"
 - _target_: lightning.pytorch.loggers.CSVLogger
@@ -144,6 +156,11 @@ these go stale silently otherwise, since nothing errors, the commands just launc
   name: "csv"
   version: ""
 ```
+
+`hydra:runtime.output_dir` should point at the unified per-run output folder (see
+`infra-checklist.md`'s Output-folder convention) so the config snapshot, `train.log`, checkpoints, and
+these logger subdirs all land together under one run-id-scoped directory — not split across a separate
+legacy checkpoints-only tree.
 
 instantiated in the entrypoint via a small loop over `hydra.utils.instantiate`, and passed as
 `Trainer(logger=loggers)`. Every `self.log`/`self.log_dict` call is then broadcast to *every* logger in
@@ -157,6 +174,20 @@ record and W&B), not something to apply together.
 `trainer.precision: "bf16-mixed"` as a config string replaces any manual autocast/GradScaler code the
 original loop had. Cross-reference `framework-migration.md`'s bf16-over-fp16 guidance — it applies
 identically here.
+
+## Worked nuance: task-conditioned multi-head training
+
+A pattern worth reusing rather than reinventing when a target repo needs to train against several related
+but distinct label sets at once (e.g. multiple object-class groups plus several map layers, all from the
+same batch): keep one shared backbone/decoder, but make the segmentation head(s) and the metrics they're
+scored against config-driven per task, rather than hardcoding a fixed head/metric list into the
+`LightningModule`. Concretely, this means a composite head that fans out to per-group sub-heads based on
+an `object_groups`-style config list, and a matching `metric_groups` config that determines which metrics
+get computed (and which checkpoint metric gets monitored) for the currently-configured task. This keeps
+`module.py` itself generic across "train on vehicles only" vs. "train jointly on vehicles + bikes +
+pedestrians + map" — the task config changes, not the module code. If a target repo has this kind of
+multi-task shape (or is likely to grow into one), prefer this config-driven composite-head pattern over a
+one-off hardcoded head for whatever the first task happens to be.
 
 ## Verification specifics for this path
 

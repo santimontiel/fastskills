@@ -45,6 +45,43 @@ uv sync --python 3.11    # pin the venv explicitly
 Check this before assuming a resolver/build failure means the dependency itself is broken — it's often
 just a missing wheel for the specific Python version `uv` happened to default to.
 
+## Real `uv`-specific `pyproject.toml` machinery (grounded in tinycar-dev's actual config)
+
+These are the concrete `uv` features that show up in reference repos with vendored native extensions or
+unusual build requirements — recognize them, and only carry over the ones the target repo actually needs
+(see `infra-checklist.md`'s note on not copying vendored-CUDA machinery into a repo with no vendored
+extension):
+
+```toml
+[tool.uv.sources]
+torch = [{ index = "pytorch-cu129" }]
+torchvision = [{ index = "pytorch-cu129" }]
+# a vendored native extension installed as an editable local-path dependency, not from PyPI:
+some_cuda_ext = { path = "./<pkg>/ops/some-cuda-ext" }
+
+[tool.uv.extra-build-dependencies]
+# some packages (e.g. flash-attn) need torch importable at their OWN build time, not just at
+# runtime — this is a real uv-specific gotcha, distinct from a normal runtime dependency.
+flash-attn = [{ requirement = "torch", match-runtime = true }]
+
+[[tool.uv.index]]
+name = "pytorch-cu129"
+url = "https://download.pytorch.org/whl/cu129"
+explicit = true
+
+[dependency-groups]
+dev = ["ipykernel>=7.1.0", "pyyaml>=6.0"]  # dev-only extras, not shipped to the container image
+
+[tool.uv]
+# for dependencies distributed as a plain wheel index rather than a proper PyPI package
+# (e.g. PyG's torch-scatter/torch-sparse wheels):
+find-links = ["https://data.pyg.org/whl/torch-2.8.0+cu129.html"]
+```
+
+`[tool.uv.sources]`'s local-path form is specifically how a vendored CUDA extension under `<pkg>/ops/`
+(see `package-restructuring.md`) gets installed as part of `uv sync` without being published anywhere —
+the extension has its own nested `pyproject.toml`/`setup.py` and gets referenced by path, not by version.
+
 ## GPU/CUDA index selection
 
 Always verify the actual GPU driver on the deploy target via `nvidia-smi` (max supported CUDA version is

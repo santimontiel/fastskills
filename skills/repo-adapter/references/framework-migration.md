@@ -2,9 +2,12 @@
 
 Bumping a training framework across major versions is its own distinct sub-task from the infra plumbing —
 budget real time for it, it's usually bigger than it looks. This file's concrete checklist is for PyTorch
-Lightning 1.x → 2.5+, the most common case in this ecosystem, but the same "check the target framework's
-migration guide for the version jump, then audit for these categories of breakage" approach applies to any
-framework bump.
+Lightning 1.x → 2.5+ (tinycar-dev's current version, and the target to match unless Before You Start says
+otherwise), the most common case in this ecosystem, but the same "check the target framework's migration
+guide for the version jump, then audit for these categories of breakage" approach applies to any framework
+bump. The instantiation pattern reference repos actually use is Hydra's `_target_` + `hydra.utils.instantiate`
+(see `config-systems.md`) — verify a migrated `Trainer`/callback/logger config still resolves through that
+mechanism, not a hand-built kwargs dict.
 
 ## PyTorch Lightning 1.x → 2.5+ checklist
 
@@ -34,6 +37,18 @@ framework bump.
   that later receives values from a tensor which could be a different dtype under autocast — these crash
   or silently corrupt under bf16/fp16 mixed precision. Fix by deriving the buffer's dtype from the source
   tensor's `.dtype` rather than hardcoding it.
+- **TF32 and pairwise-distance ops don't mix silently — audit any `torch.cdist` (or similar pairwise
+  distance) call under TF32.** A real, documented case (see `references/case-studies.md`'s tinycar-dev
+  entry): enabling TF32 matmul alongside a `torch.cdist`-based distance computation silently produced NaNs
+  for a specific input distribution, zeroing out an entire branch's contribution for a full multi-epoch
+  training run with no crash and no visibly-broken loss curve. The fix was forcing full-fp32 matmul for the
+  affected computation plus an explicit degenerate-case guard. Treat this as a standing instruction, not
+  just historical trivia: whenever a migration changes precision/TF32 settings on a repo with a `cdist`-like
+  op, explicitly check intermediate tensor statistics (not just the loss curve) for NaN/Inf before trusting
+  the run — this is exactly the case `verification.md`'s "check log scalars for NaN/Inf explicitly" step
+  exists for, and it's a concrete instance of the fidelity-over-idiom principle in `SKILL.md`: a "cleaner"
+  precision setting that silently changes numeric output has failed the port, however plausible the curves
+  look.
 
 ## Dependency-drift gotchas (not framework-specific, but always surface at this stage)
 

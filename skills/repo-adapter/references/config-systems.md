@@ -8,12 +8,30 @@ precedence helper reimplementing what Hydra's native `key=value` CLI overrides a
 **and** the user explicitly agrees during Before You Start. Never migrate a working yacs, OmegaConf, or
 argparse-based config system just because Hydra is the more familiar tool; `fiery-radar`/`powerbev-radar`
 both explicitly kept their yacs config as-is, only bumping its dependency version, and that was the right
-call for those repos.
+call for those repos. This is a direct application of `SKILL.md`'s fidelity-over-idiom principle: Hydra
+being "the more Pythonic/modern choice" is not itself a reason to touch a config system that already works
+correctly.
 
-If migrating: design the new config tree mirroring the reference repo's actual structure
-(`configs/{data,module,task}/*.yaml` + top-level `train.yaml`/`eval.yaml` with a `defaults:` list is the
-common shape), translating every existing config key one-for-one rather than inventing a new structure
-from scratch — this keeps behavior identical while only changing the mechanism.
+## The real Hydra shape (tinycar-dev), if migrating or extending
+
+If migrating, or extending an existing Hydra setup: mirror the actual composition pattern reference repos
+use, not a generic Hydra tutorial layout.
+
+- **Groups**: `configs/{data,module,task}/*.yaml`, composed via a top-level `train.yaml`/`eval.yaml`'s
+  `defaults:` list — `data` selects the dataset variant, `module` selects the model/encoder combination,
+  `task` selects what the model is trained/evaluated to do (e.g. a single object class vs. a joint
+  multi-task setup with several object groups + map layers).
+- **Instantiation**: every leaf config carries a `_target_` key pointing at the real Python class/function,
+  resolved via `hydra.utils.instantiate` at the entrypoint — there is no separate registry to keep in sync;
+  the config *is* the registry. When migrating, grep for the actual class name to confirm where a
+  `_target_` string should point, rather than inventing a path.
+- **Interpolation for derived values**: don't duplicate a value that's actually derived from others — e.g.
+  a wandb project name built from the dataset and task (`project: "tinycar_${data.model_config.dataset_name}_${task.key}"`)
+  should stay an OmegaConf interpolation, not a literal string that can drift out of sync with the
+  `data`/`task` selection actually in effect.
+- Translate every existing config key one-for-one when migrating, rather than inventing a new structure
+  from scratch — this keeps behavior identical while only changing the mechanism, consistent with the
+  fidelity-over-idiom principle above.
 
 ## The DDP + Hydra chdir bug
 

@@ -10,6 +10,23 @@ Typical starting state: pinned to an old Python/torch/framework version via `env
 `requirements.txt`, or `setup.py`; no `Dockerfile`; no Slurm scripts; no `tools/` entrypoint layout; no
 CI. Not every one of these needs to be true to proceed — adapt what's actually missing.
 
+## Check for the `faststart` scaffolding shortcut first
+
+Before hand-authoring `Dockerfile`/`entrypoint.sh`/`Makefile`/`deploy/slurm/*.sh`/the `pyproject.toml`
+skeleton from scratch, check whether the `faststart` CLI (`faststart <ProjectName> [dest]`) can generate
+this layer directly — it stamps out exactly this boilerplate via placeholder substitution, kept in sync
+with tinycar-dev's own infra fixes. Two things to verify before relying on it:
+- **Freshness**: the installed copy (normally `~/.local/bin/faststart` + `~/.local/share/faststart/template`)
+  can silently lag the source repo. Run `faststart --update`, or diff the installed template's
+  `.faststart-meta` and `deploy/` contents against the source repo, before trusting its output.
+- **Scope**: it only covers the infra layer (Docker, Slurm, Makefile, `pyproject.toml` skeleton, empty
+  `CLAUDE.md`/`.project-root` markers) — no `configs/`, no package skeleton, no Lightning module code. The
+  rest of this checklist (and `package-restructuring.md`/`config-systems.md`) still applies on top of it.
+- Author metadata and the DockerHub account are hardcoded in the template, not parameterized by the CLI —
+  they still need the manual confirmation described below regardless of whether `faststart` was used.
+- Per the skill's tooling-caution non-negotiable: verify `faststart`'s actual argument parsing (or any
+  other scaffolding CLI) before running it with untested flags, and run `git status` afterward.
+
 ## `pyproject.toml` + `uv.lock`
 
 - Match the reference repo's `requires-python` and `torch==` pin, and its custom `pytorch-cuXXX` uv index,
@@ -37,6 +54,11 @@ memory), then rename per confirmed values from Before You Start:
 - Slurm job names, partition names, GPU counts, cluster paths (`/raid/${USER}/...`-style) in every
   `deploy/slurm/*.sh`.
 - `figlet` banner text and any other cosmetic repo-name strings in `entrypoint.sh`.
+- **`-dev` suffix trimming**: if the target repo's checkout name carries a `-dev` suffix (e.g.
+  `tinycar-dev`), keep the suffix in the on-disk/checkout name and anywhere Slurm needs to `cd` into the
+  real checkout, but trim it from the Docker image name, container name, Python package name, and Slurm
+  job names. Getting the trim order wrong (bare-slug substitution running before the suffixed-slug
+  substitution) can leave a stray `-dev` behind — apply the suffixed substitution first.
 
 Reference repos have differing script sets — some have `deploy/slurm/debug_terminal.sh`, some don't; some
 Makefiles have a `jupyter` target, some don't. Only include what's actually useful for the target, but
@@ -85,6 +107,22 @@ per-run output directory (e.g. `train_log/models/` or `outputs/<run>/checkpoints
 Verify-phase training run writes to). This is a real, confirmed convention (`gcarpred-dev/checkpoints/`):
 a human manually copies checkpoints worth keeping there after reviewing results. It is never
 auto-populated by the training loop itself — don't wire any code to write into it automatically.
+
+**Avoid unversioned checkpoint dirpaths.** A concrete, observed failure mode: pointing
+`ModelCheckpoint(dirpath=...)` (or the hand-rolled equivalent) at a fixed, non-run-scoped path causes
+Lightning's own filename-collision handling (`-v1`, `-v2`, ...) to silently pile up debug-run checkpoints
+at that path across repeated short/debug runs, each several hundred MB to a few GB, without ever being
+cleaned up. Scope the checkpoint dirpath to the current run's own output directory (see the unified
+per-run output-folder convention below), not a shared fixed path.
+
+## Output-folder convention
+
+Every run should write into **one unified, run-id-scoped output directory** — config snapshot, training
+log, checkpoints, and csv/wandb logger subdirs all together under it (e.g.
+`outputs/train/${run_id}/{'.hydra/', 'train.log', 'checkpoints/', 'csv/', 'wandb/'}`). This is the current
+convention to replicate; an older convention some repos may still have on disk (a `logs/<project>/<run_id>/`
+tree holding only `checkpoints/`, with no config snapshot or log file retained locally) is legacy/orphaned
+output from before this was unified — don't propagate that older split shape into a newly adapted repo.
 
 ## Config system
 

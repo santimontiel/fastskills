@@ -1,0 +1,27 @@
+# TEMPLATE: companion Hydra config for assets/compile_bf16_sweep.py. Copy into the target repo's
+# configs/ directory (e.g. configs/fast_torch.yaml) alongside the tool itself, and adjust the
+# `defaults:` list to actually compose this repo's data/module/task groups so
+# `instantiate_model(cfg)` has a real model config to instantiate.
+defaults:
+  - _self_
+  # - data: <target repo's dataset config>
+  # - module: <target repo's model config>
+  # - task: <target repo's task config, if applicable>
+
+task_name: "fast_torch"
+checkpoint_path: null  # set to a real checkpoint path for realistic (non-random-init) weights
+device: "cuda:0"
+seed: 42
+
+batch_size: 1
+num_warmup_iters: 10
+num_iters: 50
+
+# Only "default" is confirmed safe once more than one stage is compiled together (CUDA-graph
+# aliasing crash otherwise) -- see references/decision-thresholds.md. This sweep compiles one stage
+# at a time, so other modes are less risky here, but don't carry a non-default mode into a
+# multi-stage production config without separately re-verifying that exact combination.
+compile_mode: "default"  # default | reduce-overhead | max-autotune
+
+# Where sweep_results.csv (append-only) and results.html (regenerated every run) are written.
+output_dir: "${hydra:runtime.cwd}/dev/outputs"

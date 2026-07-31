@@ -1,0 +1,313 @@
+<title>Claude Code token usage</title>
+<style>
+.viz-root {
+  color-scheme: light;
+  --surface-1:      #fcfcfb;
+  --surface-2:      #f4f3f0;
+  --border:         #e3e1db;
+  --text-primary:   #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted:     #83817a;
+  --series-1:       #2a78d6; /* blue */
+  --series-2:       #eb6834; /* orange */
+  --series-3:       #1baf7a; /* aqua */
+  --series-4:       #eda100; /* yellow */
+  --series-5:       #e87ba4; /* magenta */
+  --series-6:       #008300; /* green */
+  --series-7:       #4a3aa7; /* violet */
+  --series-8:       #e34948; /* red */
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  color: var(--text-primary);
+  background: var(--surface-1);
+  min-height: 100vh;
+}
+@media (prefers-color-scheme: dark) {
+  :root:where(:not([data-theme="light"])) .viz-root {
+    color-scheme: dark;
+    --surface-1:      #17171a;
+    --surface-2:      #1f1f22;
+    --border:         #333335;
+    --text-primary:   #ffffff;
+    --text-secondary: #c3c2b7;
+    --text-muted:     #8b8a85;
+    --series-1:       #3987e5;
+    --series-2:       #d95926;
+    --series-3:       #199e70;
+    --series-4:       #c98500;
+    --series-5:       #d55181;
+    --series-6:       #008300;
+    --series-7:       #9085e9;
+    --series-8:       #e66767;
+  }
+}
+:root[data-theme="dark"] .viz-root {
+  color-scheme: dark;
+  --surface-1:      #17171a;
+  --surface-2:      #1f1f22;
+  --border:         #333335;
+  --text-primary:   #ffffff;
+  --text-secondary: #c3c2b7;
+  --text-muted:     #8b8a85;
+  --series-1:       #3987e5;
+  --series-2:       #d95926;
+  --series-3:       #199e70;
+  --series-4:       #c98500;
+  --series-5:       #d55181;
+  --series-6:       #008300;
+  --series-7:       #9085e9;
+  --series-8:       #e66767;
+}
+* { box-sizing: border-box; }
+.viz-root { padding: 28px 20px 60px; }
+.wrap { max-width: 1080px; margin: 0 auto; }
+h1 { font-size: 20px; font-weight: 650; margin: 0 0 4px; }
+.subtitle { color: var(--text-secondary); font-size: 13px; margin: 0 0 24px; }
+
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 10px; margin-bottom: 28px; }
+.tile { background: var(--surface-2); border: 1px solid var(--border); border-radius: 10px; padding: 14px 16px; }
+.tile .label { font-size: 11px; color: var(--text-muted); text-transform: uppercase; letter-spacing: .03em; margin-bottom: 6px; }
+.tile .value { font-size: 22px; font-weight: 650; line-height: 1.1; }
+.tile .sub { font-size: 11.5px; color: var(--text-muted); margin-top: 4px; }
+
+.panel { background: var(--surface-2); border: 1px solid var(--border); border-radius: 12px; padding: 18px 18px 8px; margin-bottom: 24px; }
+.panel-head { display: flex; align-items: baseline; justify-content: space-between; margin-bottom: 14px; flex-wrap: wrap; gap: 8px; }
+.panel-title { font-size: 14px; font-weight: 650; }
+.panel-note { font-size: 12px; color: var(--text-muted); }
+
+.legend { display: flex; gap: 14px; flex-wrap: wrap; margin-bottom: 10px; font-size: 12px; color: var(--text-secondary); }
+.legend-item { display: flex; align-items: center; gap: 6px; }
+.legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex-shrink: 0; }
+
+.chart-scroll { overflow-x: auto; padding-bottom: 4px; }
+.chart { display: flex; align-items: flex-end; gap: 3px; height: 220px; min-width: 720px; position: relative; border-bottom: 1px solid var(--border); padding-top: 8px; }
+.bar-col { display: flex; flex-direction: column-reverse; width: 100%; height: 100%; min-width: 8px; cursor: pointer; position: relative; }
+.bar-seg { width: 100%; }
+.bar-seg:not(:last-child) { margin-bottom: 2px; }
+.bar-col:hover .bar-seg { filter: brightness(1.08); }
+.axis-labels { display: flex; gap: 3px; min-width: 720px; margin-top: 6px; }
+.axis-label { width: 100%; min-width: 8px; text-align: center; font-size: 9.5px; color: var(--text-muted); white-space: nowrap; }
+
+.tooltip { position: fixed; pointer-events: none; background: var(--text-primary); color: var(--surface-1); font-size: 12px; padding: 8px 10px; border-radius: 8px; line-height: 1.5; z-index: 50; display: none; box-shadow: 0 4px 14px rgba(0,0,0,.25); white-space: nowrap; }
+.tooltip .tt-title { font-weight: 650; margin-bottom: 3px; }
+.tooltip .tt-row { display: flex; justify-content: space-between; gap: 14px; }
+.tooltip .tt-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; }
+
+table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+thead th { position: sticky; top: 0; background: var(--surface-2); text-align: right; font-weight: 600; color: var(--text-secondary); padding: 8px 10px; border-bottom: 1px solid var(--border); cursor: pointer; white-space: nowrap; user-select: none; }
+thead th:first-child, thead th:nth-child(2) { text-align: left; }
+thead th .arrow { font-size: 10px; opacity: .5; margin-left: 3px; }
+tbody td { padding: 7px 10px; text-align: right; border-bottom: 1px solid var(--border); white-space: nowrap; }
+tbody td:first-child, tbody td:nth-child(2) { text-align: left; }
+tbody tr:hover { background: var(--surface-2); }
+.model-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 11.5px; color: var(--text-secondary); }
+.model-badge .dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+.table-scroll { overflow-x: auto; max-height: 560px; overflow-y: auto; border: 1px solid var(--border); border-radius: 12px; }
+.table-scroll table { min-width: 760px; }
+
+.foot-note { font-size: 12px; color: var(--text-muted); margin-top: 6px; line-height: 1.6; }
+</style>
+
+<div class="viz-root">
+<div class="wrap">
+  <h1>Claude Code token usage</h1>
+  <p class="subtitle" id="subtitle"></p>
+
+  <div class="tiles" id="tiles"></div>
+
+  <div class="panel">
+    <div class="panel-head">
+      <div class="panel-title">Daily token usage by model</div>
+      <div class="panel-note">Billable-ish tokens (input + output + cache writes) — excludes cache reads, which dwarf everything else under prompt caching</div>
+    </div>
+    <div class="legend" id="legend"></div>
+    <div class="chart-scroll">
+      <div class="chart" id="chart"></div>
+      <div class="axis-labels" id="axisLabels"></div>
+    </div>
+  </div>
+
+  <div class="panel">
+    <div class="panel-head">
+      <div class="panel-title">All conversations</div>
+      <div class="panel-note">Click a column header to sort · 67 rows</div>
+    </div>
+    <div class="table-scroll">
+      <table id="tbl">
+        <thead><tr>
+          <th data-k="date">Date</th>
+          <th data-k="project">Project</th>
+          <th data-k="model_primary">Model</th>
+          <th data-k="messages">Msgs</th>
+          <th data-k="output">Output</th>
+          <th data-k="cache_creation">Cache write</th>
+          <th data-k="cache_read">Cache read</th>
+          <th data-k="billable">Billable</th>
+          <th data-k="total">Total</th>
+        </tr></thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <p class="foot-note">"Billable" = input + output + cache-write tokens (what roughly tracks spend). "Total" also includes cache-read tokens, which are ~90% cheaper than fresh input and inflated heavily by prompt caching re-reading long conversation context on every turn.</p>
+  </div>
+</div>
+</div>
+<div class="tooltip" id="tooltip"></div>
+
+<script>
+const rows = __ROWS_JSON__;
+const skippedCount = __SKIPPED_COUNT__;
+
+// Categorical slots, fixed order (validated CVD-safe adjacent pairs).
+const PALETTE_SLOTS = ["var(--series-1)", "var(--series-2)", "var(--series-3)", "var(--series-4)",
+                        "var(--series-5)", "var(--series-6)", "var(--series-7)", "var(--series-8)"];
+
+function prettyModel(id) {
+  let s = id.replace(/^claude-/, "").replace(/-\d{6,}$/, "");
+  const parts = s.split("-");
+  const name = parts[0].charAt(0).toUpperCase() + parts[0].slice(1);
+  const version = parts.slice(1).join(".");
+  return version ? `${name} ${version}` : name;
+}
+
+// Assign colors by rank (total billable tokens desc) so the busiest model always gets slot 1.
+const modelTotals = {};
+for (const r of rows) {
+  for (const m of r.models.split("|")) {
+    modelTotals[m] = (modelTotals[m] || 0) + r.billable / r.models.split("|").length;
+  }
+}
+const MODEL_ORDER = Object.keys(modelTotals).sort((a, b) => modelTotals[b] - modelTotals[a]);
+const MODEL_COLORS = {};
+const MODEL_LABELS = {};
+MODEL_ORDER.forEach((m, i) => {
+  // Never cycle hues: past the 8 categorical slots, fold into a neutral "Other" color.
+  MODEL_COLORS[m] = i < PALETTE_SLOTS.length ? PALETTE_SLOTS[i] : "var(--text-muted)";
+  MODEL_LABELS[m] = prettyModel(m);
+});
+
+function fmt(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(2) + "B";
+  if (n >= 1e6) return (n/1e6).toFixed(2) + "M";
+  if (n >= 1e3) return (n/1e3).toFixed(1) + "K";
+  return String(n);
+}
+function fmtFull(n) { return n.toLocaleString("en-US"); }
+
+// ---- stat tiles ----
+const totalConvos = rows.length;
+const totalTokens = rows.reduce((a,r)=>a+r.total,0);
+const billableTotal = rows.reduce((a,r)=>a+r.billable,0);
+const outputTotal = rows.reduce((a,r)=>a+r.output,0);
+const cacheReadTotal = rows.reduce((a,r)=>a+r.cache_read,0);
+const dates = rows.map(r=>r.date).sort();
+
+document.getElementById("subtitle").innerHTML =
+  `All ${totalConvos} local conversations found in <code>~/.claude/projects/</code>, ${dates[0]} → ${dates[dates.length-1]}` +
+  (skippedCount > 0 ? `. ${skippedCount} file(s) skipped (permission denied).` : ".");
+
+const tiles = [
+  { label: "Conversations", value: totalConvos, sub: `${dates[0]} → ${dates[dates.length-1]}` },
+  { label: "Total tokens (all-in)", value: fmt(totalTokens), sub: fmtFull(totalTokens) + " incl. cache reads" },
+  { label: "Billable-ish total", value: fmt(billableTotal), sub: "input + output + cache writes" },
+  { label: "Output tokens generated", value: fmt(outputTotal), sub: fmtFull(outputTotal) },
+  { label: "Cache reads", value: fmt(cacheReadTotal), sub: (cacheReadTotal/totalTokens*100).toFixed(1) + "% of all-in total" },
+];
+document.getElementById("tiles").innerHTML = tiles.map(t => `
+  <div class="tile">
+    <div class="label">${t.label}</div>
+    <div class="value">${t.value}</div>
+    <div class="sub">${t.sub}</div>
+  </div>`).join("");
+
+// ---- legend ----
+const modelsPresent = MODEL_ORDER.filter(m => rows.some(r => r.models.split("|").includes(m)));
+document.getElementById("legend").innerHTML = modelsPresent.map(m => `
+  <div class="legend-item"><span class="legend-swatch" style="background:${MODEL_COLORS[m]}"></span>${MODEL_LABELS[m]}</div>
+`).join("");
+
+// ---- daily aggregation ----
+const byDay = {};
+for (const r of rows) {
+  if (!byDay[r.date]) byDay[r.date] = {};
+  // split each session's billable tokens across its models evenly (most sessions are single-model)
+  const models = r.models.split("|");
+  const share = r.billable / models.length;
+  for (const m of models) {
+    byDay[r.date][m] = (byDay[r.date][m] || 0) + share;
+  }
+}
+const days = Object.keys(byDay).sort();
+const dayTotals = days.map(d => Object.values(byDay[d]).reduce((a,b)=>a+b,0));
+const maxDay = Math.max(...dayTotals);
+
+const chartEl = document.getElementById("chart");
+const axisEl = document.getElementById("axisLabels");
+let barsHtml = "";
+let axisHtml = "";
+for (const d of days) {
+  const dayData = byDay[d];
+  const segs = MODEL_ORDER.filter(m => dayData[m]).map(m => {
+    const h = (dayData[m] / maxDay) * 100;
+    return `<div class="bar-seg" style="height:${h}%; background:${MODEL_COLORS[m]}; border-radius: 3px 3px 0 0;" data-model="${m}"></div>`;
+  }).join("");
+  const dayTotal = Object.values(dayData).reduce((a,b)=>a+b,0);
+  barsHtml += `<div class="bar-col" data-date="${d}" data-total="${dayTotal}">${segs}</div>`;
+  const dd = d.slice(8,10);
+  axisHtml += `<div class="axis-label">${dd}</div>`;
+}
+chartEl.innerHTML = barsHtml;
+axisEl.innerHTML = axisHtml;
+
+const tooltip = document.getElementById("tooltip");
+chartEl.querySelectorAll(".bar-col").forEach(col => {
+  col.addEventListener("mousemove", (e) => {
+    const d = col.dataset.date;
+    const dayData = byDay[d];
+    const rowsHtml = MODEL_ORDER.filter(m => dayData[m]).map(m => `
+      <div class="tt-row"><span><span class="tt-swatch" style="background:${MODEL_COLORS[m]}"></span>${MODEL_LABELS[m]}</span><span>${fmtFull(Math.round(dayData[m]))}</span></div>
+    `).join("");
+    tooltip.innerHTML = `<div class="tt-title">${d}</div>${rowsHtml}<div class="tt-row" style="margin-top:3px; padding-top:3px; border-top:1px solid rgba(255,255,255,.2)"><span>Total</span><span>${fmtFull(Math.round(col.dataset.total))}</span></div>`;
+    tooltip.style.display = "block";
+    tooltip.style.left = (e.clientX + 14) + "px";
+    tooltip.style.top = (e.clientY + 14) + "px";
+  });
+  col.addEventListener("mouseleave", () => tooltip.style.display = "none");
+});
+
+// ---- table ----
+let sortKey = "date";
+let sortDir = 1;
+function renderTable() {
+  const sorted = [...rows].sort((a,b) => {
+    let av = a[sortKey], bv = b[sortKey];
+    if (typeof av === "string") { av = av.toLowerCase(); bv = bv.toLowerCase(); }
+    if (av < bv) return -1 * sortDir;
+    if (av > bv) return 1 * sortDir;
+    return 0;
+  });
+  document.getElementById("tbody").innerHTML = sorted.map(r => {
+    const primaryModel = r.models.split("|")[0];
+    const modelBadges = r.models.split("|").map(m => `<span class="model-badge"><span class="dot" style="background:${MODEL_COLORS[m]||'#999'}"></span>${MODEL_LABELS[m]||m}</span>`).join(" ");
+    return `<tr>
+      <td>${r.date}</td>
+      <td title="${r.sessionid}">${r.project}</td>
+      <td>${modelBadges}</td>
+      <td>${r.messages}</td>
+      <td>${fmtFull(r.output)}</td>
+      <td>${fmtFull(r.cache_creation)}</td>
+      <td>${fmtFull(r.cache_read)}</td>
+      <td><strong>${fmtFull(r.billable)}</strong></td>
+      <td>${fmtFull(r.total)}</td>
+    </tr>`;
+  }).join("");
+}
+document.querySelectorAll("#tbl thead th").forEach(th => {
+  th.addEventListener("click", () => {
+    const k = th.dataset.k;
+    if (sortKey === k) sortDir *= -1; else { sortKey = k; sortDir = k === "date" ? -1 : -1; }
+    renderTable();
+  });
+});
+sortDir = -1;
+renderTable();
+</script>

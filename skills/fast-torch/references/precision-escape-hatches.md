@@ -1,8 +1,10 @@
 # Precision escape hatches
 
-When the bf16-compatibility probe (see `SKILL.md` workflow step 4) flags a stage, there are **two
+When the bf16-compatibility probe (see `SKILL.md` workflow step 4) flags a stage, there are **three
 distinct fixes** used across the lineage — picking the right one depends on *why* it failed, not on
-a fixed rule. Read the actual exception or NaN pattern before choosing.
+a fixed rule. Read the actual exception or NaN pattern before choosing. Pattern C is a different
+*class* of bug from A/B — read its own section before assuming the probe already covers it, because
+it doesn't.
 
 ## Pattern A: `torch.autocast(enabled=False)` around a whole submodule
 
@@ -56,6 +58,41 @@ NaN/Inf appearing several ops downstream of where you'd expect, suspect this pat
 backward to the actual op producing bad values, rather than wrapping the first "suspicious-looking"
 submodule in `autocast(enabled=False)`.
 
+## Pattern C: `.float()` before a bf16 tensor crosses into non-PyTorch code
+
+Use when the crash isn't in the model's math at all, but in what happens to the model's OUTPUT
+afterward — logging, preview images, metrics computed with NumPy/OpenCV/Matplotlib, anything outside
+PyTorch's own tensor ops. The tell: `TypeError: Got unsupported ScalarType BFloat16` (or an equivalent
+from whatever library), not a `RuntimeError` from a CUDA kernel and not a silent NaN — NumPy has no
+native bfloat16 dtype at all, so `.cpu().numpy()` on a bf16 tensor hard-crashes unconditionally,
+regardless of GPU/backend.
+
+**Confirmed recurring across repos in this lineage** (per direct user report — this is not a one-off):
+a training loop's preview/visualization logging (`_log_previews`-style helper, called periodically to
+save/log sample images) calls `.detach().cpu().numpy()` on the model's raw output tensors. Those
+tensors are computed inside the bf16-mixed autocast region, so they arrive as `bfloat16` — the FIRST
+time bf16-mixed is actually exercised end-to-end in a real training run, not before. Confirmed real on
+JustDepth (2026-07-30): `JustDepthModule._log_previews` crashed on `logits[0].detach().cpu().numpy()`
+~150 steps into the first bf16-mixed training run ever attempted on this repo. Fixed the same way each
+time — insert `.float()` right before the `.cpu()`/`.numpy()` boundary, on exactly the tensors that
+are themselves model outputs (raw dataloader inputs like images/lidar/radar are untouched by autocast
+and don't need this):
+
+```python
+logit = logits[0].float().detach().cpu().numpy()  # was: logits[0].detach().cpu().numpy()
+confidence_vis = confidence_vis[0].float().detach().cpu().numpy()
+```
+
+**Why the bf16-compatibility probe (SKILL.md step 4) does NOT catch this**: the probe only runs the
+model's `forward()` under bf16 autocast and checks the returned tensors for NaN/Inf — it never calls
+`.numpy()` or exercises any training-loop logging/preview code, because that code isn't part of the
+model at all. A clean probe result says nothing about this class of bug. **The only thing that catches
+it is SKILL.md step 9's real training run** — one more reason that step is the actual acceptance gate,
+not the sweep numbers. Before enabling `trainer.precision=bf16-mixed` for training (as opposed to just
+inference), grep the training step / any periodic logging helper for `.numpy()`, `.item()` calls in a
+loop building a Python list per-pixel, `cv2.*`, or any other non-PyTorch consumer downstream of the
+model's own outputs, and pre-emptively add `.float()` there rather than waiting to hit the crash live.
+
 ## Also watch for: an implicit-cast assumption that silently breaks
 
 Not every bf16 bug is "this op needs a fp32 escape hatch" — sometimes it's dead/incorrect code that
@@ -68,6 +105,8 @@ actually matches what the config produces, not what the author assumed the confi
 
 ## Verify the fix, don't just apply it
 
-After applying either pattern, **re-run the bf16 probe** on that exact stage before moving on. A
+After applying Pattern A or B, **re-run the bf16 probe** on that exact stage before moving on. A
 fix that "looks right" but doesn't actually clear the NaN (wrong scope, wrong op targeted) is worse
-than not fixing it at all, since it looks resolved in the report but isn't.
+than not fixing it at all, since it looks resolved in the report but isn't. Pattern C fixes can't be
+verified by the probe at all (see its own section) — re-run the actual training step / logging code
+path that crashed instead.

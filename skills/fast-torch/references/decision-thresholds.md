@@ -17,6 +17,17 @@ real, reported result, not a measurement error).
 | **10% – 20%** | `AskUserQuestion` — presenting the real number | Real but marginal; whether it's worth the added complexity (debugging a compiled module is harder — breakpoints inside it get skipped over) is a judgment call, not a fixed rule |
 | **< 10%, or a regression, or a crash** | Leave eager | Not worth the complexity for a marginal or negative return |
 
+**Run-to-run variance near the bands is real, not a bug** (confirmed on JustDepth, 2026-07-30):
+`radar_encoder` measured +24.0% on one sweep run and +13.8%/+19.3% on two repeats minutes later on
+the same idle GPU — enough to flip its classification from "default" to "ask" between runs.
+Individual per-stage sweep numbers close to a threshold should be treated as noisy; the fix used here
+was pinning the combined whole-model benchmark (step 10) to the already-decided/shipped
+`compile_stages` set via an explicit override (`compile_stages=` on the tool's own Hydra config, not
+the sweep's own per-run classification) rather than re-deciding the stage list on every invocation. If
+a stage's classification flips between repeat runs, prefer more iterations (`num_iters`) and a longer
+warmup over trusting either single run in isolation, and don't be surprised if the "recommended"
+`compile_stages=...` line differs slightly between two otherwise-identical invocations.
+
 A **crash** on a `KNOWN_COMPILE_HOSTILE_STAGES` entry (or an undeclared one) is its own bucket, not
 folded into "< 10%" — report it as "compile-hostile: `<exception>`", not as a numeric zero.
 

@@ -2,8 +2,10 @@
 name: fast-torch
 description: Introduces torch.compile + bf16-mixed precision into a research repo's network for
   faster training/inference with no accuracy regression, via a per-module bf16-compatibility probe,
-  a full precision x compile sweep, and threshold-driven auto/ask/skip decisions wired into Hydra
-  config using the family's comma-separated compile_stages convention. Use this whenever the user
+  a full precision x compile sweep, threshold-driven auto/ask/skip decisions wired into Hydra
+  config using the family's comma-separated compile_stages convention, and a final combined
+  whole-model benchmark (ms/sample, Hz, and peak memory, with vs. without the chosen stages compiled
+  together). Use this whenever the user
   explicitly runs /fast-torch, or asks to "add torch.compile", "enable bf16", "speed up
   training/inference", "mixed precision", "compile sweep", or "make this repo faster without losing
   accuracy". Do not trigger automatically just because a repo looks slow — this is a heavy,
@@ -101,7 +103,12 @@ what's automatic and what still needs a human/Claude to fill in.
    fix — read the actual exception/NaN pattern to pick the right one from
    `references/precision-escape-hatches.md` (a whole-submodule `autocast(enabled=False)` wrap for
    "no bf16 kernel at all," vs. narrower explicit `.float()` casts for "this specific op needs
-   fp32 regardless of ambient autocast").
+   fp32 regardless of ambient autocast"). **This probe only exercises `forward()` — it does NOT catch
+   a recurring, confirmed-multiple-times class of bug where a training loop's own preview/logging
+   code calls `.cpu().numpy()` on a bf16 model output** (NumPy has no bfloat16 dtype at all; hard
+   crash, not a NaN). Only a real training run (step 9) catches this — see
+   `references/precision-escape-hatches.md`'s Pattern C before assuming a clean probe means bf16-mixed
+   training is actually safe end-to-end.
 
 5. **Apply the escape hatch(es)** identified in step 4 to the target repo's actual model code, then
    re-run the probe to confirm the fix actually clears it (don't assume — verify).
@@ -109,11 +116,16 @@ what's automatic and what still needs a human/Claude to fill in.
 6. **Run the full sweep**: precision (`fp32` × `bf16-mixed`) × compile (`eager` × `compiled`,
    per-stage in isolation, restoring each stage to eager before moving to the next). A stage crash
    here (see Principles) is caught, reported, and the sweep continues — this must be an unattended,
-   complete pass, not one CLI invocation per cell of the grid.
+   complete pass, not one CLI invocation per cell of the grid. Run it via `num_repeats` (3+
+   recommended, `run_sweep_repeated` in the template), not a single pass — individual per-stage
+   numbers are noisy enough near the decision thresholds to flip a stage's classification between
+   otherwise-identical runs (confirmed real, see `references/decision-thresholds.md`); classify from
+   the mean speedup across repeats, not any single run's number.
 
-7. **Classify each stage** against `references/decision-thresholds.md`'s bands. For every
-   **10–20%** stage, use `AskUserQuestion` — present the actual measured number, don't just say
-   "some stages are borderline."
+7. **Classify each stage** against `references/decision-thresholds.md`'s bands, using the
+   `num_repeats`-averaged speedup from step 6, not a single run's. For every **10–20%** stage, use
+   `AskUserQuestion` — present the actual measured number (and its spread across repeats if notably
+   noisy), don't just say "some stages are borderline."
 
 8. **Wire the decision into Hydra config** — the family's comma-separated `compile_stages` string
    convention (`references/hydra-wiring.md`), including the CLI single-quoting caveat and the
@@ -124,12 +136,34 @@ what's automatic and what still needs a human/Claude to fill in.
    baseline lined up in step 1. No NaN/Inf in logged scalars across the run. This is the actual
    acceptance gate, not the benchmark numbers alone.
 
-10. **Generate the HTML report** (`dev/results.html` or wherever the target's benchmark output
-    already lives) — the deliverable: per-stage eager-vs-compiled latency under both precisions,
-    memory gains, the bf16-probe result per stage, and the final auto/ask/skip decision table with
-    the exact `compile_stages=...` line to paste.
+10. **Combined whole-model benchmark** — the per-stage sweep in step 6 deliberately never compiles
+    more than one stage at a time (see Principles), so it never produces a number for what actually
+    ships: the real `compile_stages` set from step 8, all compiled together, on the whole model. Run
+    one more measurement pass — eager (nothing compiled) vs. every chosen stage compiled together via
+    `compile_mode="default"` — over the whole model, at every precision that passed the bf16 probe
+    for the chosen stages. Report **both** ms/sample and Hz (`1000 / ms_per_sample` — a stakeholder
+    reading throughput off a dashboard thinks in Hz, one reading a latency budget thinks in ms; give
+    both rather than making them convert) and **peak memory MB**, before and after. This is the
+    number a user actually cares about ("how much faster is inference, really") and must be measured
+    fresh, not approximated by summing the isolated per-stage deltas from step 6 — hook overhead
+    (a `torch.cuda.synchronize()` per stage boundary) inflates the sum of isolated per-stage numbers
+    above the true whole-pass latency, confirmed on a real run (JustDepth: per-stage bf16 `eager_ms`
+    summed to ~9.8ms, the clean whole-pass measurement came in at 7.1ms) — see
+    `references/case-studies.md`. Repeat this with `num_repeats` too (`run_combined_benchmark`'s own
+    parameter) and report mean ± stdev, not a single reading — cheaper than repeating step 6's sweep,
+    since `torch.compile` is entered once per precision and only the timed forward passes repeat.
+    Present the headline ms/sample + Hz numbers as stat-tile cards at the very top of the report (one
+    group of 4 per precision — see `references/case-studies.md`'s dataviz-skill note), not buried in a
+    table at the bottom; that's where a reader actually looks first.
 
-11. **Self-Improve** — two separate updates, not one:
+11. **Generate the HTML report** (`dev/results.html` or wherever the target's benchmark output
+    already lives) — the deliverable: step 10's stat-tile cards at the top, then per-stage
+    eager-vs-compiled latency under both precisions, memory gains, the bf16-probe result per stage,
+    step 10's combined whole-model comparison table (ms/sample, Hz, peak memory, both before and
+    after) as its own section, and the final auto/ask/skip decision table with the exact
+    `compile_stages=...` line to paste.
+
+12. **Self-Improve** — two separate updates, not one:
     - Append a dated entry to `references/case-studies.md`: target repo, measured numbers, which
       stages needed an escape hatch and which pattern fixed them, decisions made, anything not
       covered by these reference docs. Same discipline `repo-adapter` uses — don't skip it.
@@ -160,4 +194,5 @@ what's automatic and what still needs a human/Claude to fill in.
   `"bf16"`-string-match bug, PTv3's no-mixed-precision-backward limitation, CUDA-graph aliasing on
   multi-stage `reduce-overhead`/`max-autotune`).
 - `assets/compile_bf16_sweep.py` — the `dev/` tool template: hook-based stage discovery, bf16
-  probe, sweep driver, CSV history, and the HTML report generator.
+  probe, sweep driver, the step-10 combined whole-model benchmark (eager vs. chosen stages compiled
+  together, ms/sample + Hz + peak memory), CSV history, and the HTML report generator.

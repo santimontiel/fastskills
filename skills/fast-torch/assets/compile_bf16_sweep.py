@@ -15,12 +15,32 @@ NOT a drop-in file. Before using it on a real repo:
      forward() calls directly -- named_children() finds everything else automatically. See
      references/stage-discovery.md for real examples (camera_unprojection, gaussian_evolution,
      query_init across the lineage) and why these can't be auto-discovered.
-  4. Fill in `KNOWN_COMPILE_HOSTILE_STAGES` if you already know which stage(s) wrap a vendored CUDA
+  4. Fill in `CONTAINER_CHILD_STAGES` if any top-level nn.Module child is itself a container
+     (nn.Sequential/nn.ModuleList) whose own forward() is bypassed -- the parent's forward() manually
+     indexes `self.some_container[i](x)` in a Python loop instead of calling the container as a whole
+     (confirmed real in JustDepth's `graph_backbone`, an 8-block GNN stack). named_children() finds
+     the container fine, but a hook on the container itself never fires (its __call__ is never
+     invoked), and compiling+swapping the container attribute would break the `[i]` indexing
+     (OptimizedModule doesn't proxy __getitem__). See references/stage-discovery.md.
+  5. Fill in `KNOWN_COMPILE_HOSTILE_STAGES` if you already know which stage(s) wrap a vendored CUDA
      op / sparse-conv backend with no fake-tensor kernel (optional -- an undeclared crash is still
      caught and reported, this just labels it immediately). See references/stage-discovery.md.
-  5. If the target repo already has a tools/benchmark.py-style per-stage tool (tinycar-dev and
+  6. If the target repo already has a tools/benchmark.py-style per-stage tool (tinycar-dev and
      gcarpred-dev both do), prefer EXTENDING it with this file's bf16-probe + sweep-driver + HTML
      upgrade rather than replacing proven, hand-tuned tooling -- see SKILL.md step 1.
+  7. If the target repo's eval/FLOPs-profiling tooling (e.g. a thop.profile() call) runs against the
+     SAME model instance you compile, apply compile strictly after that profiling call, not before --
+     a compiled submodule is enumerated twice by model.modules() (once as itself, once via its
+     OptimizedModule wrapper's delegation), which breaks hook-registration-per-module tools like thop
+     with a "buffer already exists"-style error (confirmed real in JustDepth's tools/eval.py).
+  8. Add `num_repeats` (int, default 1 -- 3+ recommended) and `compile_stages` (str, default "none")
+     fields to this tool's own Hydra config (its `config_name` target, e.g. `configs/fast_torch.yaml`).
+     `num_repeats` repeats both the per-stage sweep and the combined benchmark, reporting mean +/-
+     stdev and classifying from the mean -- single-run numbers near a decision threshold are noisy
+     (confirmed real on JustDepth: one stage's fp32 speedup measured +24.0%, +13.8%, +19.3% on three
+     back-to-back runs on the same idle GPU). `compile_stages` lets the combined benchmark (step 10)
+     be pinned to an already-decided/shipped stage set instead of re-deriving it from this run's own
+     (possibly different) classification -- see references/decision-thresholds.md.
 
 Usage (inside the container, matching the lineage's uv-first convention):
     uv run dev/compile_bf16_sweep.py
@@ -29,8 +49,9 @@ Usage (inside the container, matching the lineage's uv-first convention):
 
 Design notes:
   - Stage discovery is automatic for nn.Module children (via model.named_children()) plus whatever
-    bound-method stages are added to EXTRA_METHOD_STAGES -- see references/stage-discovery.md for
-    exactly what's automatic and what needs a human to fill in.
+    bound-method stages are added to EXTRA_METHOD_STAGES, plus whatever container-child stages are
+    added to CONTAINER_CHILD_STAGES -- see references/stage-discovery.md for exactly what's automatic
+    and what needs a human to fill in.
   - The bf16-compatibility probe and the per-stage latency timing both use forward hooks rather than
     hand-duplicating the model's forward() control flow into a parallel "forward_with_timing()" --
     every existing lineage tools/benchmark.py does that duplication and carries an explicit "keep in
@@ -43,14 +64,25 @@ Design notes:
     tools/benchmark_compile.py, not tinycar-dev/gcarpred-dev's hard-crash-is-fine-for-one-invocation
     convention. This tool is meant to run the *entire* sweep unattended in one invocation, so a crash
     on one stage must not kill the rest of the grid.
+  - CONFIRMED ON A REAL GPU (JustDepth, 2026-07-30, see references/case-studies.md): hooking a module
+    that IS the current torch.compile target corrupts its own timing -- Dynamo traces the pre/post
+    hook's side effects (a Python list append, a torch.cuda.Event.elapsed_time call) as part of the
+    compiled graph, since OptimizedModule's __call__ invokes the wrapped module's __call__ (hooks
+    included), not just its bare .forward(). Symptoms ranged from silently wrong numbers (garbage
+    negative-tens-of-thousands-percent "speedups") to an outright crash once Dynamo also hit its
+    recompile limit. Fixed here by never hooking the stage currently being compiled -- its compiled
+    latency is instead derived from the whole-pass wall-clock delta (see _timed_pass/run_sweep) --
+    which is now the ONLY measurement path for every stage's compiled number, not just a bound-method
+    fallback as an earlier draft of this file assumed.
 """
 import csv
 import datetime
 import logging
+import statistics
 from collections import defaultdict
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Union
 
 import hydra
 import rootutils
@@ -70,6 +102,15 @@ EXTRA_METHOD_STAGES: dict[str, Union[str, Callable[[nn.Module], str]]] = {
     #     "grid_sample": "_grid_sample_query_init", "knn_gaussian": "_knn_gaussian_query_init",
     # }[model.query_init_mode],
 }
+# name -> attribute name of a top-level nn.Sequential/nn.ModuleList child whose own forward() the
+# parent model bypasses by manually indexing `self.<attr>[i](x)` in a Python loop (confirmed real in
+# JustDepth's `graph_backbone`, an 8-block GNN stack -- see references/stage-discovery.md). Each
+# child is measured/compiled individually and rolled up into one logical stage; the container
+# attribute itself is never hooked or compiled directly, since its __call__ is never invoked by
+# forward() and compiling it would break the `[i]` indexing (OptimizedModule doesn't proxy __getitem__).
+CONTAINER_CHILD_STAGES: dict[str, str] = {
+    # "graph_backbone": "graph_backbone",
+}
 KNOWN_COMPILE_HOSTILE_STAGES: tuple[str, ...] = ()
 # ---------------------------------------------------------------------------------------------
 
@@ -78,80 +119,144 @@ THRESHOLD_ASK_PCT = 10.0  # >this (and <=THRESHOLD_DEFAULT_PCT) -> ask the user;
 
 
 def instantiate_model(cfg: DictConfig) -> nn.Module:
-    """Placeholder -- wire to the target repo's actual Hydra module config, e.g.:
+    """Placeholder -- wire to the target repo's actual Hydra model instantiation, e.g.:
     return hydra.utils.instantiate(cfg.module.model)
+    If the repo builds its model via timm.create_model/a hand-rolled factory instead (JustDepth does),
+    reuse whatever the repo's own eval/inference entrypoint already does to load+`.eval()` real
+    checkpoint weights, rather than reimplementing model construction here.
     """
-    raise NotImplementedError("Wire this to the target repo's Hydra model instantiation.")
+    raise NotImplementedError("Wire this to the target repo's model instantiation.")
 
 
 def build_synthetic_batch(cfg: DictConfig, device: str) -> dict:
     """Placeholder -- shape a random batch matching the target model's real forward() input. See
     an existing tools/benchmark.py's build_random_batch()/build_synthetic_batch() in this repo or a
     sibling repo for the exact tensor shapes -- reuse that logic rather than guessing from scratch.
+    Adjust every `model(batch)` call below to this repo's actual forward() signature -- a dict batch
+    is the common shape across this lineage, but not universal (JustDepth's forward(images, radar,
+    get_confidence=...) takes positional tensors instead).
     """
     raise NotImplementedError("Wire this to the target repo's actual input shapes.")
 
 
-def discover_stages(model: nn.Module) -> dict[str, str]:
-    """Auto-discovered nn.Module children, plus the manually-declared bound-method stages."""
-    stages = {name: name for name, _ in model.named_children()}
-    for name, attr in EXTRA_METHOD_STAGES.items():
-        stages[name] = attr(model) if callable(attr) else attr
+def discover_stage_modules(model: nn.Module) -> dict[str, list[nn.Module]]:
+    """Every top-level nn.Module child becomes a one-element stage. CONTAINER_CHILD_STAGES entries
+    become a multi-element stage of the container's own children instead of the container itself (see
+    the module docstring and references/stage-discovery.md) -- the container's own forward() is never
+    called, so hooking/compiling it directly would measure nothing or break indexing.
+    """
+    stages: dict[str, list[nn.Module]] = {}
+    container_attrs = set(CONTAINER_CHILD_STAGES.values())
+    for name, child in model.named_children():
+        if name in container_attrs:
+            continue  # handled below via CONTAINER_CHILD_STAGES, not as a plain one-module stage
+        stages[name] = [child]
+    for stage_name, attr in CONTAINER_CHILD_STAGES.items():
+        container = getattr(model, attr)
+        if isinstance(container, nn.Identity):
+            continue  # e.g. a config that zeroes out this stage entirely -- nothing to measure
+        stages[stage_name] = [container[i] for i in range(len(container))]
     return stages
 
 
 @contextmanager
-def compiled_stage(model: nn.Module, attr: str, mode: str):
-    """Attribute-swap torch.compile, restoring the original (eager) callable in a `finally:` block
+def compiled_stage(model: nn.Module, stage_name: str, mode: str):
+    """Attribute-swap torch.compile, restoring the original eager callable(s) in a `finally:` block
     regardless of success or failure -- so one stage crashing never leaves the model in a partially
-    -compiled, inconsistent state for the next stage's measurement.
+    -compiled, inconsistent state for the next stage's measurement. CONTAINER_CHILD_STAGES entries
+    compile+reassign each child in place via Sequential/ModuleList.__setitem__ instead of swapping the
+    container attribute itself (see module docstring).
     """
     compile_kwargs = {} if mode == "default" else {"mode": mode}
-    original = getattr(model, attr)
-    setattr(model, attr, torch.compile(original, **compile_kwargs))
-    try:
+    if stage_name in CONTAINER_CHILD_STAGES:
+        attr = CONTAINER_CHILD_STAGES[stage_name]
+        container = getattr(model, attr)
+        originals = [container[i] for i in range(len(container))]
+        try:
+            for i, orig in enumerate(originals):
+                container[i] = torch.compile(orig, **compile_kwargs)
+            yield
+        finally:
+            for i, orig in enumerate(originals):
+                container[i] = orig
+            if hasattr(torch, "_dynamo"):
+                torch._dynamo.reset()
+    else:
+        original = getattr(model, stage_name)
+        setattr(model, stage_name, torch.compile(original, **compile_kwargs))
+        try:
+            yield
+        finally:
+            setattr(model, stage_name, original)
+            if hasattr(torch, "_dynamo"):
+                torch._dynamo.reset()
+
+
+@contextmanager
+def compiled_combined(model: nn.Module, stage_names: set[str], mode: str):
+    """Compiles multiple stages TOGETHER -- the actual production `compile_stages` set from step 8,
+    not an isolated single stage like `compiled_stage()` above (used for the per-stage sweep in step
+    6, which deliberately never combines stages -- see Principles). This is what step 10's combined
+    whole-model benchmark measures against: the real shipped configuration, not an approximation from
+    summing isolated per-stage deltas (see `whole_model_benchmark`'s docstring for why that sum is
+    unreliable). Only `mode="default"` is confirmed safe once more than one stage is compiled
+    together -- see `references/decision-thresholds.md`'s CUDA-graph aliasing crash on
+    `reduce-overhead`/`max-autotune`. Implemented as a stack of `compiled_stage()` context managers so
+    the CONTAINER_CHILD_STAGES vs. plain-attribute handling isn't duplicated.
+    """
+    with ExitStack() as stack:
+        for name in stage_names:
+            stack.enter_context(compiled_stage(model, name, mode))
         yield
-    finally:
-        setattr(model, attr, original)
-        if hasattr(torch, "_dynamo"):
-            torch._dynamo.reset()
 
 
 class StageLatencyProbe:
-    """Forward hooks on every nn.Module stage, recording per-stage GPU latency across iterations via
+    """Forward hooks on every stage's module(s), recording per-stage GPU latency across iterations via
     paired torch.cuda.Event, synced individually (so a compiled stage's async kernels are timed
     correctly, and one stage's timing never leaks into another's). Attached once per timed pass and
-    covers every discovered nn.Module stage simultaneously, regardless of which single stage is
-    currently compiled -- this is what lets one pass produce the full per-stage breakdown, instead of
-    needing one script invocation per stage the way every existing lineage tools/benchmark.py does.
+    covers every discovered stage simultaneously except whichever is passed via `exclude`.
 
-    Bound-method stages (EXTRA_METHOD_STAGES) are NOT covered here -- a forward hook needs an
-    nn.Module to attach to. Their isolated timing instead falls back to the whole-model wall-clock
-    delta between an eager baseline pass and the pass where that stage alone is compiled (see
-    run_sweep()) -- an approximation (assumes all else held equal), not a precise isolated number.
+    A stage backed by more than one module (a CONTAINER_CHILD_STAGES entry) has every child's hook
+    write into the same name key -- summed per forward pass in summary(), which is the correct
+    aggregate cost of "run this stage once" since each child is invoked exactly once per pass (unlike
+    a DT_STEPS-style single-module-called-repeatedly stage -- see references/use-cases.md -- this is n
+    distinct child modules, each called once).
+
+    CONFIRMED (not just theorized) to corrupt timing if a hooked module is also the current
+    torch.compile target -- see the module docstring's 2026-07-30 entry. `exclude` MUST contain the
+    name of whichever stage is currently wrapped in torch.compile, if any; that stage's compiled
+    latency is derived from the whole-pass wall-clock delta in run_sweep() instead, which never
+    touches the compiled module with any instrumentation.
+
+    Bound-method stages (EXTRA_METHOD_STAGES) are NOT covered here either -- a forward hook needs an
+    nn.Module to attach to. Their isolated timing also falls back to the same whole-pass delta.
     """
 
-    def __init__(self, stage_modules: dict[str, nn.Module]):
+    def __init__(self, stage_modules: dict[str, list[nn.Module]], exclude: frozenset[str] = frozenset()):
         self.samples_ms: dict[str, list[float]] = defaultdict(list)
-        self._starts: dict[str, torch.cuda.Event] = {}
+        self._pending: dict[str, list[torch.cuda.Event]] = defaultdict(list)
         self._handles = []
-        for name, module in stage_modules.items():
-            self._handles.append(module.register_forward_pre_hook(self._pre(name)))
-            self._handles.append(module.register_forward_hook(self._post(name)))
+        for name, modules in stage_modules.items():
+            if name in exclude:
+                continue
+            for module in modules:
+                self._handles.append(module.register_forward_pre_hook(self._pre(name)))
+                self._handles.append(module.register_forward_hook(self._post(name)))
 
     def _pre(self, name: str):
         def _hook(module, args):
             ev = torch.cuda.Event(enable_timing=True)
             ev.record()
-            self._starts[name] = ev
+            self._pending[name].append(ev)
         return _hook
 
     def _post(self, name: str):
         def _hook(module, args, output):
+            start = self._pending[name].pop(0)
             end = torch.cuda.Event(enable_timing=True)
             end.record()
             torch.cuda.synchronize()
-            self.samples_ms[name].append(self._starts[name].elapsed_time(end))
+            self.samples_ms[name].append(start.elapsed_time(end))
         return _hook
 
     def remove(self) -> None:
@@ -159,15 +264,18 @@ class StageLatencyProbe:
             h.remove()
 
     def summary(self) -> dict[str, dict[str, float]]:
+        """Per-iteration total ms for each stage: sum ALL recorded samples (across every child module
+        and every iteration) and divide by the known iteration count -- correct uniformly whether the
+        stage is backed by one module (samples == num_iters) or a CONTAINER_CHILD_STAGES entry's n
+        children (samples == num_iters * n), since every child fires exactly once per forward pass.
+        """
         out = {}
+        n_iters = getattr(self, "_iters_hint", None)
         for name, samples in self.samples_ms.items():
-            t = torch.tensor(samples)
-            if t.numel() == 0:
+            if not samples:
                 continue
-            out[name] = {
-                "mean_ms": t.mean().item(),
-                "std_ms": t.std().item() if t.numel() > 1 else 0.0,
-            }
+            divisor = n_iters if n_iters else len(samples)
+            out[name] = {"mean_ms": sum(samples) / divisor, "std_ms": 0.0}
         return out
 
 
@@ -187,7 +295,7 @@ def _iter_tensors(obj):
             yield from _iter_tensors(v)
 
 
-def probe_bf16_compatibility(model: nn.Module, stage_modules: dict[str, nn.Module], batch: dict) -> dict[str, str]:
+def probe_bf16_compatibility(model: nn.Module, stage_modules: dict[str, list[nn.Module]], batch: dict) -> dict[str, str]:
     """One forward pass under bf16 autocast, checking every stage's hooked output(s) for NaN/Inf.
 
     Returns {stage_name: "ok" | "nan" | "crashed: <message>"}.
@@ -224,8 +332,9 @@ def probe_bf16_compatibility(model: nn.Module, stage_modules: dict[str, nn.Modul
                     saw_nan[name] = True
         return _hook
 
-    for name, module in stage_modules.items():
-        handles.append(module.register_forward_hook(_capture(name)))
+    for name, modules in stage_modules.items():
+        for module in modules:
+            handles.append(module.register_forward_hook(_capture(name)))
 
     try:
         with torch.no_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
@@ -248,20 +357,47 @@ def probe_bf16_compatibility(model: nn.Module, stage_modules: dict[str, nn.Modul
     return results
 
 
-def run_sweep(cfg: DictConfig, model: nn.Module, stage_attrs: dict[str, str], bf16_ok: dict[str, str]) -> list[dict]:
+def _timed_pass(model: nn.Module, batch: dict, stage_modules: dict[str, list[nn.Module]],
+                 autocast_ctx, cfg: DictConfig, exclude: frozenset[str] = frozenset()
+                 ) -> tuple[dict[str, dict[str, float]], float, float]:
+    """Returns (per-stage hook summary [excluding `exclude`], peak memory MB, whole-pass mean ms).
+    The whole-pass timing wraps the entire model(batch) call with CUDA events at the top level --
+    never via a hook on a torch.compile'd module (see StageLatencyProbe's docstring) -- so it stays
+    valid even when a stage under `exclude` is currently wrapped in torch.compile.
+    """
+    probe = StageLatencyProbe(stage_modules, exclude=exclude)
+    probe._iters_hint = cfg.num_iters
+    torch.cuda.reset_peak_memory_stats(cfg.device)
+    with torch.no_grad(), autocast_ctx:
+        for _ in range(cfg.num_warmup_iters):
+            model(batch)
+        torch.cuda.synchronize(cfg.device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(cfg.num_iters):
+            model(batch)
+        end.record()
+        torch.cuda.synchronize(cfg.device)
+        whole_pass_ms = start.elapsed_time(end) / cfg.num_iters
+    summary = probe.summary()
+    probe.remove()
+    peak_mb = torch.cuda.max_memory_allocated(cfg.device) / 1024**2
+    return summary, peak_mb, whole_pass_ms
+
+
+def run_sweep(cfg: DictConfig, model: nn.Module, stage_modules: dict[str, list[nn.Module]],
+              bf16_ok: dict[str, str], batch: dict) -> list[dict]:
     """The full precision x compile grid: for each precision in (fp32, bf16-mixed) -- skipping bf16
     for any stage the probe flagged as not "ok" -- run one eager baseline pass (all stages, via
-    StageLatencyProbe) plus one isolated-compile pass per stage, computing per-stage speedup.
+    StageLatencyProbe) plus one isolated-compile pass per stage. Every stage's compiled latency is
+    derived from the whole-pass wall-clock delta, not a hook on the compiled module itself (see
+    StageLatencyProbe's docstring for why hooking the compile target is unsafe).
 
     Returns a list of result rows, one per (stage, precision), ready to append to the CSV history and
     feed into the HTML report.
     """
-    stage_modules = {name: getattr(model, attr) for name, attr in stage_attrs.items() if isinstance(getattr(model, attr), nn.Module)}
     rows: list[dict] = []
-
-    # Built ONCE, reused for both precisions -- comparing fp32 vs bf16 on different random batches
-    # would add noise the comparison doesn't need; the input doesn't depend on precision.
-    batch = build_synthetic_batch(cfg, cfg.device)
 
     for precision in ("fp32", "bf16"):
         autocast_ctx = (
@@ -269,33 +405,10 @@ def run_sweep(cfg: DictConfig, model: nn.Module, stage_attrs: dict[str, str], bf
             if precision == "bf16" else nullcontext()
         )
 
-        def _timed_pass(iters: int) -> tuple[dict[str, dict[str, float]], float]:
-            # NOTE (unverified): torch.compile applied to model.<attr> wraps that attribute in an
-            # OptimizedModule; forward hooks registered on the ORIGINAL module object (captured in
-            # stage_modules before compilation) are expected to still fire, since PyTorch's
-            # nn.Module.__call__ (where hooks live) sits outside the compiled forward() body Dynamo
-            # traces. This is a reasonable expectation, not something actually verified on a GPU in
-            # this environment -- if a compiled stage's timing/probe numbers come back suspiciously
-            # identical to its eager baseline, hook-skipping under compile is the first thing to
-            # check, not a red herring.
-            probe = StageLatencyProbe(stage_modules)
-            torch.cuda.reset_peak_memory_stats(cfg.device)
-            with torch.no_grad(), autocast_ctx:
-                for _ in range(cfg.num_warmup_iters):
-                    model(batch)
-                torch.cuda.synchronize(cfg.device)
-                for _ in range(iters):
-                    model(batch)
-                torch.cuda.synchronize(cfg.device)
-            summary = probe.summary()
-            probe.remove()
-            peak_mb = torch.cuda.max_memory_allocated(cfg.device) / 1024**2
-            return summary, peak_mb
-
         log.info(f"[{precision}] eager baseline pass ({cfg.num_iters} iterations)...")
-        eager_summary, eager_peak_mb = _timed_pass(cfg.num_iters)
+        eager_summary, eager_peak_mb, eager_whole_ms = _timed_pass(model, batch, stage_modules, autocast_ctx, cfg)
 
-        for name, attr in stage_attrs.items():
+        for name in stage_modules:
             if precision == "bf16" and bf16_ok.get(name) not in ("ok",):
                 rows.append({
                     "stage": name, "precision": precision, "eager_ms": eager_summary.get(name, {}).get("mean_ms"),
@@ -309,16 +422,20 @@ def run_sweep(cfg: DictConfig, model: nn.Module, stage_attrs: dict[str, str], bf
                 log.info(f"[{precision}] {name}: known compile-hostile stage, expect a crash or graph break.")
 
             try:
-                with compiled_stage(model, attr, cfg.compile_mode):
-                    compiled_summary, compiled_peak_mb = _timed_pass(cfg.num_iters)
+                with compiled_stage(model, name, cfg.compile_mode):
+                    # exclude={name}: hooking the module currently wrapped in torch.compile corrupts
+                    # its own timing (see StageLatencyProbe docstring) -- its compiled latency is
+                    # derived below from the whole-pass wall-clock delta instead.
+                    _, compiled_peak_mb, compiled_whole_ms = _timed_pass(
+                        model, batch, stage_modules, autocast_ctx, cfg, exclude=frozenset({name})
+                    )
                 eager_ms = eager_summary.get(name, {}).get("mean_ms")
-                compiled_ms = compiled_summary.get(name, {}).get("mean_ms")
-                if eager_ms and compiled_ms:
+                compiled_ms = (compiled_whole_ms - eager_whole_ms + eager_ms) if eager_ms is not None else None
+                if eager_ms and compiled_ms is not None:
                     speedup_pct = (eager_ms - compiled_ms) / eager_ms * 100
                     decision = classify(speedup_pct)
                 else:
-                    # bound-method stage: no hook-based per-stage number, fall back to whole-model delta
-                    speedup_pct, decision = None, "manual (bound-method stage, see stage-discovery.md)"
+                    speedup_pct, decision = None, "unmeasured"
                 rows.append({
                     "stage": name, "precision": precision, "eager_ms": eager_ms, "compiled_ms": compiled_ms,
                     "speedup_pct": round(speedup_pct, 1) if speedup_pct is not None else None,
@@ -343,6 +460,166 @@ def classify(speedup_pct: float) -> str:
     if speedup_pct < 0:
         return "regression"
     return "skip"
+
+
+def whole_model_benchmark(model: nn.Module, batch: dict, autocast_ctx, cfg: DictConfig) -> dict[str, float]:
+    """Whole-model latency + peak memory, with NO per-stage hooks attached at all -- the true
+    end-to-end number, not an approximation from summing isolated per-stage measurements. Confirmed
+    on a real run (JustDepth, 2026-07-30) that the two disagree: per-stage bf16 `eager_ms` values from
+    run_sweep() summed to ~9.8ms, while this clean whole-pass measurement came in at 7.1ms -- the
+    difference is hook overhead (StageLatencyProbe's per-stage `torch.cuda.synchronize()` calls),
+    which the isolated per-stage sweep pays but real inference never does. See
+    `references/case-studies.md`.
+    """
+    torch.cuda.reset_peak_memory_stats(cfg.device)
+    with torch.no_grad(), autocast_ctx:
+        for _ in range(cfg.num_warmup_iters):
+            model(batch)
+        torch.cuda.synchronize(cfg.device)
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(cfg.num_iters):
+            model(batch)
+        end.record()
+        torch.cuda.synchronize(cfg.device)
+    ms_per_sample = start.elapsed_time(end) / cfg.num_iters
+    peak_mem_mb = torch.cuda.max_memory_allocated(cfg.device) / 1024**2
+    hz = 1000.0 / ms_per_sample if ms_per_sample > 0 else float("inf")
+    return {"ms_per_sample": ms_per_sample, "hz": hz, "peak_mem_mb": peak_mem_mb}
+
+
+def _aggregate(samples: list[dict[str, float]]) -> dict[str, float]:
+    """Mean + stdev across repeat whole_model_benchmark() calls. stdev is 0.0 for a single sample
+    (statistics.stdev requires >=2) rather than raising -- num_repeats=1 is a valid, if noisier, config.
+    """
+    ms = [s["ms_per_sample"] for s in samples]
+    hz = [s["hz"] for s in samples]
+    mem = [s["peak_mem_mb"] for s in samples]
+    return {
+        "ms_per_sample": statistics.mean(ms), "ms_per_sample_std": statistics.stdev(ms) if len(ms) > 1 else 0.0,
+        "hz": statistics.mean(hz), "hz_std": statistics.stdev(hz) if len(hz) > 1 else 0.0,
+        "peak_mem_mb": statistics.mean(mem), "peak_mem_mb_std": statistics.stdev(mem) if len(mem) > 1 else 0.0,
+    }
+
+
+def run_combined_benchmark(cfg: DictConfig, model: nn.Module, batch: dict,
+                            compile_stage_names: set[str], bf16_ok: dict[str, str],
+                            num_repeats: int = 1) -> list[dict]:
+    """Step 10: the whole-model, chosen-stages-together comparison -- eager (nothing compiled) vs.
+    the actual `compile_stages` set from step 8, compiled as ONE combined configuration
+    (`compile_mode="default"` only, per Principles). This is the number that answers "how much faster
+    is inference, really" -- distinct from run_sweep()'s per-stage isolated grid, which never compiles
+    more than one stage at a time and whose per-stage numbers should not be summed to approximate this
+    (see whole_model_benchmark's docstring).
+
+    `num_repeats` repeats the whole_model_benchmark() TIMING pass `num_repeats` times per precision
+    (mean +/- stdev reported), WITHOUT recompiling between repeats -- torch.compile is entered once
+    per precision and the timed forward-pass loop runs num_repeats times inside that single compiled
+    context. This measurement is noticeably more stable run-to-run than run_sweep()'s per-stage delta
+    numbers (confirmed on JustDepth: combined fp32 eager latency varied by only ~3% of its mean across
+    3 repeats, vs. individual per-stage speedups varying by 10-40 points of their own mean over the
+    same 3 repeats) -- see `references/decision-thresholds.md`.
+
+    A precision is skipped entirely if ANY chosen stage failed the bf16 probe -- running the combined
+    configuration under bf16 would be unsafe/invalid if even one of its stages isn't bf16-clean,
+    regardless of what the OTHER stages' probe results say.
+    """
+    rows: list[dict] = []
+    for precision in ("fp32", "bf16"):
+        if precision == "bf16" and any(bf16_ok.get(name) != "ok" for name in compile_stage_names):
+            unsafe = sorted(n for n in compile_stage_names if bf16_ok.get(n) != "ok")
+            log.warning(f"Skipping combined bf16 benchmark -- bf16-unsafe stage(s) in compile_stages: {unsafe}")
+            rows.append({
+                "precision": "bf16", "eager_ms": None, "eager_ms_std": None, "eager_hz": None, "eager_hz_std": None,
+                "eager_mem_mb": None, "compiled_ms": None, "compiled_ms_std": None, "compiled_hz": None,
+                "compiled_hz_std": None, "compiled_mem_mb": None,
+                "speedup_pct": None, "note": f"skipped (bf16-unsafe stage(s): {unsafe})",
+            })
+            continue
+
+        autocast_ctx = (
+            torch.autocast(device_type="cuda", dtype=torch.bfloat16)
+            if precision == "bf16" else nullcontext()
+        )
+        eager = _aggregate([whole_model_benchmark(model, batch, autocast_ctx, cfg) for _ in range(num_repeats)])
+
+        row = {
+            "precision": precision,
+            "eager_ms": round(eager["ms_per_sample"], 3), "eager_ms_std": round(eager["ms_per_sample_std"], 3),
+            "eager_hz": round(eager["hz"], 1), "eager_hz_std": round(eager["hz_std"], 1),
+            "eager_mem_mb": round(eager["peak_mem_mb"], 1),
+        }
+        if compile_stage_names:
+            with compiled_combined(model, compile_stage_names, cfg.compile_mode):
+                compiled = _aggregate([whole_model_benchmark(model, batch, autocast_ctx, cfg) for _ in range(num_repeats)])
+            speedup_pct = (eager["ms_per_sample"] - compiled["ms_per_sample"]) / eager["ms_per_sample"] * 100
+            row.update({
+                "compiled_ms": round(compiled["ms_per_sample"], 3), "compiled_ms_std": round(compiled["ms_per_sample_std"], 3),
+                "compiled_hz": round(compiled["hz"], 1), "compiled_hz_std": round(compiled["hz_std"], 1),
+                "compiled_mem_mb": round(compiled["peak_mem_mb"], 1),
+                "speedup_pct": round(speedup_pct, 1), "note": None,
+            })
+        else:
+            row.update({
+                "compiled_ms": None, "compiled_ms_std": None, "compiled_hz": None, "compiled_hz_std": None,
+                "compiled_mem_mb": None,
+                "speedup_pct": None, "note": "compile_stages empty -- nothing to compare",
+            })
+        rows.append(row)
+    return rows
+
+
+def run_sweep_repeated(cfg: DictConfig, model: nn.Module, stage_modules: dict[str, list[nn.Module]],
+                        bf16_ok: dict[str, str], batch: dict, num_repeats: int) -> list[dict]:
+    """Runs run_sweep() `num_repeats` times end-to-end (each rep recompiles every stage in turn --
+    unlike run_combined_benchmark's single-compile-many-timed-passes design, there's no cheaper way to
+    repeat an isolated per-stage measurement) and aggregates each (stage, precision) cell's eager_ms/
+    compiled_ms/speedup_pct as mean +/- stdev across reps, re-classifying from the MEAN speedup rather
+    than trusting any single run.
+
+    Confirmed necessary on a real GPU (JustDepth, 2026-07-30): a stage's fp32 speedup measured +24.0%,
+    then +13.8%, then +19.3% on three back-to-back sweeps on the same idle GPU -- enough to flip its
+    classification between "default" and "ask" run to run. A single sweep's classification for a stage
+    near either threshold should not be trusted in isolation -- see `references/decision-thresholds.md`.
+    """
+    reps = [run_sweep(cfg, model, stage_modules, bf16_ok, batch) for _ in range(num_repeats)]
+    keyed: dict[tuple[str, str], list[dict]] = defaultdict(list)
+    for rep_rows in reps:
+        for r in rep_rows:
+            keyed[(r["stage"], r["precision"])].append(r)
+
+    aggregated: list[dict] = []
+    for (stage, precision), rs in sorted(keyed.items()):
+        eager_vals = [r["eager_ms"] for r in rs if r.get("eager_ms") is not None]
+        compiled_vals = [r["compiled_ms"] for r in rs if r.get("compiled_ms") is not None]
+        speedup_vals = [r["speedup_pct"] for r in rs if r.get("speedup_pct") is not None]
+        mem_eager = [r["peak_mem_eager_mb"] for r in rs if r.get("peak_mem_eager_mb") is not None]
+        mem_compiled = [r["peak_mem_compiled_mb"] for r in rs if r.get("peak_mem_compiled_mb") is not None]
+
+        if speedup_vals and compiled_vals:
+            speedup_mean = statistics.mean(speedup_vals)
+            row = {
+                "stage": stage, "precision": precision,
+                "eager_ms": round(statistics.mean(eager_vals), 3) if eager_vals else None,
+                "compiled_ms": round(statistics.mean(compiled_vals), 3),
+                "speedup_pct": round(speedup_mean, 1),
+                "speedup_pct_std": round(statistics.stdev(speedup_vals), 1) if len(speedup_vals) > 1 else 0.0,
+                "decision": classify(speedup_mean),
+            }
+        else:
+            # every rep skipped/crashed/unmeasured for this cell -- surface the (first) reason as-is
+            row = {
+                "stage": stage, "precision": precision,
+                "eager_ms": round(statistics.mean(eager_vals), 3) if eager_vals else None,
+                "compiled_ms": None, "speedup_pct": None, "speedup_pct_std": None,
+                "decision": rs[0]["decision"],
+            }
+        row["peak_mem_eager_mb"] = round(statistics.mean(mem_eager), 1) if mem_eager else None
+        row["peak_mem_compiled_mb"] = round(statistics.mean(mem_compiled), 1) if mem_compiled else None
+        row["num_repeats"] = num_repeats
+        aggregated.append(row)
+    return aggregated
 
 
 def append_csv_rows(csv_path: Path, timestamp: str, rows: list[dict]) -> None:
@@ -385,12 +662,65 @@ def _status_for(row: dict) -> tuple[str, str]:
     return _STATUS.get(decision, ("muted", decision or "?"))
 
 
-def render_html_report(bf16_probe: dict[str, str], rows: list[dict], compile_stages_line: str) -> str:
+def _stat_tile(label: str, value: str, std: float = None, delta_pct: float = None, up_is_good: bool = True) -> str:
+    std_html = f'<div class="stat-range">± {std:.2f}</div>' if std else ""
+    delta_html = ""
+    if delta_pct is not None:
+        good = (delta_pct > 0) == up_is_good
+        status = "good" if good else "critical"
+        sign = "+" if delta_pct >= 0 else ""
+        delta_html = f'<div class="stat-delta status-{status}">{sign}{delta_pct:.1f}% vs eager</div>'
+    return f"""<div class="stat-tile"><div class="stat-label">{_esc(label)}</div><div class="stat-value">{_esc(value)}</div>{std_html}{delta_html}</div>"""
+
+
+def _stat_group(prec_label: str, row: dict) -> str:
+    """4 cards for one precision: eager/compiled latency + eager/compiled throughput. Delta color
+    follows the dataviz skill's stat-tile contract (direction x whether up is good) -- lower is good
+    for latency, higher is good for Hz.
+    """
+    eager_ms, compiled_ms = row["eager_ms"], row["compiled_ms"]
+    eager_hz, compiled_hz = row["eager_hz"], row["compiled_hz"]
+    ms_delta_pct = (compiled_ms - eager_ms) / eager_ms * 100
+    hz_delta_pct = (compiled_hz - eager_hz) / eager_hz * 100
+    return f"""<div class="stat-group">
+      <div class="stat-group-label">{_esc(prec_label)}</div>
+      <div class="stat-grid">
+        {_stat_tile("Eager latency", f"{eager_ms:.2f} ms/sample", row.get("eager_ms_std"))}
+        {_stat_tile("Compiled latency", f"{compiled_ms:.2f} ms/sample", row.get("compiled_ms_std"), ms_delta_pct, up_is_good=False)}
+        {_stat_tile("Eager throughput", f"{eager_hz:.1f} Hz", row.get("eager_hz_std"))}
+        {_stat_tile("Compiled throughput", f"{compiled_hz:.1f} Hz", row.get("compiled_hz_std"), hz_delta_pct, up_is_good=True)}
+      </div>
+    </div>"""
+
+
+def render_stat_cards(combined_rows: list[dict]) -> str:
+    """The headline numbers a stakeholder actually wants: old vs new latency (ms/sample) and
+    throughput (Hz), for EVERY precision that produced a real combined comparison -- fp32-true first
+    (the conservative baseline), then bf16-mixed (the more aggressive option), each as its own row of
+    4 cards. A precision with no real comparison (compile_stages empty, or bf16 skipped as unsafe) is
+    simply omitted rather than shown with placeholder values.
+    """
+    by_precision = {r["precision"]: r for r in combined_rows}
+    groups = [
+        _stat_group(label, by_precision[prec])
+        for prec, label in (("fp32", "fp32-true"), ("bf16", "bf16-mixed"))
+        if by_precision.get(prec) and by_precision[prec].get("compiled_ms") is not None
+    ]
+    if not groups:
+        return ('<div class="card"><p class="sub">No combined benchmark available (compile_stages '
+                'empty, or every precision was skipped/unsafe).</p></div>')
+    return "\n".join(groups)
+
+
+def render_html_report(bf16_probe: dict[str, str], rows: list[dict], compile_stages_line: str,
+                        combined_rows: list[dict]) -> str:
     """Self-contained HTML report (no external assets), following the dataviz skill's method: a
     two-shade single-hue bar pair per stage (eager = tint, compiled = the full categorical-slot-1
     blue) for the "before -> after" job, and the fixed 4-role status palette (good/warning/serious/
     critical) -- never reused for anything else -- for the auto/ask/crash/regression decision, always
-    paired with an icon + label so the color is never the only signal.
+    paired with an icon + label so the color is never the only signal. Leads with `render_stat_cards`'
+    headline stat tiles (step 10's combined whole-model comparison), per the dataviz skill's stat-tile
+    contract, since that's the number a user actually asked "how much faster is this, really" about.
     """
     max_ms = max((r["eager_ms"] for r in rows if r.get("eager_ms")), default=1.0) or 1.0
 
@@ -398,7 +728,12 @@ def render_html_report(bf16_probe: dict[str, str], rows: list[dict], compile_sta
         eager_w = 100.0 * (r["eager_ms"] or 0) / max_ms
         compiled_w = 100.0 * (r["compiled_ms"] or 0) / max_ms if r.get("compiled_ms") else 0.0
         status, label = _status_for(r)
-        speedup = f"{r['speedup_pct']:+.1f}%" if r.get("speedup_pct") is not None else "–"
+        if r.get("speedup_pct") is None:
+            speedup = "–"
+        elif r.get("speedup_pct_std"):
+            speedup = f"{r['speedup_pct']:+.1f}% (±{r['speedup_pct_std']:.1f})"
+        else:
+            speedup = f"{r['speedup_pct']:+.1f}%"
         return f"""
         <div class="stage-row">
           <div class="stage-name">{_esc(r['stage'])} <span class="badge badge-{status}">{label}</span></div>
@@ -407,12 +742,17 @@ def render_html_report(bf16_probe: dict[str, str], rows: list[dict], compile_sta
           <div class="stage-value">{(r['eager_ms'] or 0):.2f}ms → {(r['compiled_ms'] or 0):.2f}ms <span class="status-{status}">({speedup})</span></div>
         </div>"""
 
-    probe_rows = "\n".join(
-        f"""<tr><td>{_esc(name)}</td><td class="status-{'good' if res == 'ok' else ('serious' if res.startswith('crashed') else 'critical')}">
-          {'✅ ok' if res == 'ok' else ('\U0001f4a5 ' + _esc(res) if res.startswith('crashed') else '\U0001f53a ' + _esc(res))}
-        </td></tr>"""
-        for name, res in bf16_probe.items()
-    )
+    def _probe_row(name: str, res: str) -> str:
+        # Python 3.11 f-strings can't embed a backslash escape in the expression part, so the emoji
+        # codepoints are pulled out into plain variables first (also affects render_html_report's
+        # other f-strings below if edited -- keep any \U-escaped literal outside the {} braces).
+        status = "good" if res == "ok" else ("serious" if res.startswith("crashed") else "critical")
+        crash_icon = "\U0001f4a5"
+        warn_icon = "\U0001f53a"
+        label = "✅ ok" if res == "ok" else (f"{crash_icon} {_esc(res)}" if res.startswith("crashed") else f"{warn_icon} {_esc(res)}")
+        return f"""<tr><td>{_esc(name)}</td><td class="status-{status}">{label}</td></tr>"""
+
+    probe_rows = "\n".join(_probe_row(name, res) for name, res in bf16_probe.items())
 
     by_precision: dict[str, list[dict]] = defaultdict(list)
     for r in rows:
@@ -423,6 +763,21 @@ def render_html_report(bf16_probe: dict[str, str], rows: list[dict], compile_sta
         <div class="card">{"".join(bar_pair(r) for r in sorted(prs, key=lambda r: -(r.get('eager_ms') or 0)))}</div>"""
         for prec, prs in by_precision.items()
     )
+
+    def _combined_row(r: dict) -> str:
+        if r.get("note"):
+            return f"""<tr><td>{_esc(r['precision'])}</td><td colspan="6" class="status-muted">{_esc(r['note'])}</td></tr>"""
+        speedup = f"{r['speedup_pct']:+.1f}%" if r.get("speedup_pct") is not None else "–"
+        status = "good" if (r.get("speedup_pct") or 0) > 0 else "critical"
+        return f"""<tr>
+          <td>{_esc(r['precision'])}</td>
+          <td>{r['eager_ms']:.3f}±{r['eager_ms_std']:.3f} ms</td><td>{r['eager_hz']:.1f}±{r['eager_hz_std']:.1f} Hz</td><td>{r['eager_mem_mb']:.1f} MB</td>
+          <td>{r['compiled_ms']:.3f}±{r['compiled_ms_std']:.3f} ms</td><td>{r['compiled_hz']:.1f}±{r['compiled_hz_std']:.1f} Hz</td><td>{r['compiled_mem_mb']:.1f} MB</td>
+          <td class="status-{status}">{speedup}</td>
+        </tr>"""
+
+    combined_table = "\n".join(_combined_row(r) for r in combined_rows)
+    stat_cards = render_stat_cards(combined_rows)
 
     return f"""<!doctype html>
 <html lang="en">
@@ -486,6 +841,15 @@ def render_html_report(bf16_probe: dict[str, str], rows: list[dict], compile_sta
   .status-good {{ color: var(--good); }} .status-warning {{ color: color-mix(in srgb, var(--warning) 70%, black); }}
   .status-serious {{ color: var(--serious); }} .status-critical {{ color: var(--critical); }} .status-muted {{ color: var(--text-muted); }}
   code {{ background: var(--gridline); padding: 0.15rem 0.4rem; border-radius: 4px; }}
+  .stat-group {{ margin-top: 1.25rem; }}
+  .stat-group:first-child {{ margin-top: 0.5rem; }}
+  .stat-group-label {{ font-size: 0.78rem; color: var(--text-secondary); font-weight: 600; margin-bottom: 0.5rem; text-transform: uppercase; letter-spacing: 0.02em; }}
+  .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 0.75rem; }}
+  .stat-tile {{ background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px; padding: 1rem 1.25rem; }}
+  .stat-label {{ font-size: 0.72rem; color: var(--text-muted); text-transform: uppercase; letter-spacing: 0.02em; margin-bottom: 0.4rem; }}
+  .stat-value {{ font-size: 1.6rem; font-weight: 600; font-variant-numeric: proportional-nums; }}
+  .stat-range {{ font-size: 0.72rem; color: var(--text-muted); margin-top: 0.15rem; }}
+  .stat-delta {{ font-size: 0.78rem; margin-top: 0.3rem; font-weight: 600; }}
 </style>
 </head>
 <body data-theme-root>
@@ -493,10 +857,21 @@ def render_html_report(bf16_probe: dict[str, str], rows: list[dict], compile_sta
   <h1>torch.compile / bf16-mixed sweep results</h1>
   <p class="sub">Generated {_esc(datetime.datetime.now().isoformat(timespec='seconds'))}</p>
 
+  {stat_cards}
+
   <h2>bf16-compatibility probe</h2>
   <div class="card"><table><thead><tr><th>Stage</th><th>Result</th></tr></thead><tbody>{probe_rows}</tbody></table></div>
 
   {sections}
+
+  <h2>Combined whole-model benchmark (chosen stages compiled together)</h2>
+  <p class="sub">Eager (nothing compiled) vs. every stage in compile_stages compiled as one configuration -- not a sum of the isolated per-stage numbers above (see whole_model_benchmark's docstring for why those two disagree).</p>
+  <div class="card"><table><thead><tr>
+    <th>Precision</th>
+    <th>Eager ms/sample</th><th>Eager Hz</th><th>Eager peak mem</th>
+    <th>Compiled ms/sample</th><th>Compiled Hz</th><th>Compiled peak mem</th>
+    <th>Speedup</th>
+  </tr></thead><tbody>{combined_table}</tbody></table></div>
 
   <h2>Recommended Hydra config</h2>
   <div class="card"><code>compile_stages={_esc(compile_stages_line)}</code></div>
@@ -521,11 +896,10 @@ def main(cfg: DictConfig) -> None:
 
     log.info("Instantiating model...")
     model = instantiate_model(cfg).to(cfg.device).eval()
-    stage_attrs = discover_stages(model)
-    log.info(f"Discovered stages: {sorted(stage_attrs)}")
+    stage_modules = discover_stage_modules(model)
+    log.info(f"Discovered stages: {sorted(stage_modules)}")
 
     batch = build_synthetic_batch(cfg, cfg.device)
-    stage_modules = {name: getattr(model, attr) for name, attr in stage_attrs.items() if isinstance(getattr(model, attr), nn.Module)}
 
     log.info("Running bf16-compatibility probe...")
     bf16_probe = probe_bf16_compatibility(model, stage_modules, batch)
@@ -533,36 +907,80 @@ def main(cfg: DictConfig) -> None:
         if result != "ok":
             log.warning(f"bf16 probe: {name} -> {result} (see references/precision-escape-hatches.md)")
 
-    log.info("Running the full precision x compile sweep...")
-    rows = run_sweep(cfg, model, stage_attrs, bf16_probe)
+    # num_repeats: single-run per-stage classifications are noisy near the 20%/10% thresholds
+    # (confirmed real -- see references/decision-thresholds.md); repeating and classifying from the
+    # MEAN speedup is the fix, not a nicety.
+    num_repeats = int(cfg.get("num_repeats", 1) or 1)
+    log.info(f"Running the full precision x compile sweep ({num_repeats} repeat(s))...")
+    rows = run_sweep_repeated(cfg, model, stage_modules, bf16_probe, batch, num_repeats)
 
     default_stages = sorted(r["stage"] for r in rows if r["decision"] == "default" and r["precision"] == "fp32")
     ask_stages = sorted(r["stage"] for r in rows if r["decision"] == "ask" and r["precision"] == "fp32")
     compile_stages_line = ",".join(default_stages) if default_stages else "none"
+
+    # Step 10: the actual chosen compile_stages set -- default_stages, or an explicit cfg.compile_stages
+    # override (pin the combined benchmark to an already-decided/shipped set instead of whatever THIS
+    # run's own sweep classifies, useful once a stage's classification has been seen to flip between
+    # runs -- see references/decision-thresholds.md). Extend default_stages with whatever the user
+    # chose for any ask-band stage via AskUserQuestion (step 7) before running this, if not using the
+    # override. Compiled TOGETHER, measured on the whole model -- not a substitute for run_sweep()
+    # above; a separate, later measurement of what actually ships.
+    override = str(cfg.get("compile_stages", "none") or "none").strip()
+    if override != "none":
+        combined_stage_names = {s.strip() for s in override.split(",") if s.strip()}
+        log.info(f"Using explicit compile_stages override for combined benchmark: {sorted(combined_stage_names)}")
+    else:
+        combined_stage_names = set(default_stages)
+    log.info(f"Running the combined whole-model benchmark ({num_repeats} repeat(s), chosen stages compiled together)...")
+    combined_rows = run_combined_benchmark(cfg, model, batch, combined_stage_names, bf16_probe, num_repeats)
 
     from rich.console import Console
     from rich.table import Table
 
     console = Console()
     console.rule("[bold red]fast-torch sweep results")
-    table = Table(title="Per-stage decision (fp32)")
+    table = Table(title=f"Per-stage decision (fp32, mean of {num_repeats} repeat(s))")
     table.add_column("Stage"); table.add_column("Speedup"); table.add_column("Decision")
     for r in rows:
         if r["precision"] != "fp32":
             continue
-        speedup = f"{r['speedup_pct']:+.1f}%" if r.get("speedup_pct") is not None else "-"
+        if r.get("speedup_pct") is None:
+            speedup = "-"
+        elif r.get("speedup_pct_std"):
+            speedup = f"{r['speedup_pct']:+.1f}% (±{r['speedup_pct_std']:.1f})"
+        else:
+            speedup = f"{r['speedup_pct']:+.1f}%"
         table.add_row(r["stage"], speedup, r["decision"])
     console.print(table)
     if ask_stages:
         console.print(f"[yellow]Ask the user about: {ask_stages}[/yellow]")
     console.print(f"Recommended: compile_stages={compile_stages_line!r}")
 
+    combined_table = Table(title=f"Combined whole-model benchmark (mean of {num_repeats} repeat(s), chosen stages compiled together)")
+    for col in ("Precision", "Eager ms/sample", "Eager Hz", "Eager mem", "Compiled ms/sample", "Compiled Hz", "Compiled mem", "Speedup"):
+        combined_table.add_column(col)
+    for r in combined_rows:
+        if r.get("note"):
+            combined_table.add_row(r["precision"], r["note"], "", "", "", "", "", "")
+            continue
+        combined_table.add_row(
+            r["precision"], f"{r['eager_ms']:.3f}±{r['eager_ms_std']:.3f} ms", f"{r['eager_hz']:.1f}±{r['eager_hz_std']:.1f} Hz",
+            f"{r['eager_mem_mb']:.1f} MB",
+            f"{r['compiled_ms']:.3f}±{r['compiled_ms_std']:.3f} ms", f"{r['compiled_hz']:.1f}±{r['compiled_hz_std']:.1f} Hz",
+            f"{r['compiled_mem_mb']:.1f} MB",
+            f"{r['speedup_pct']:+.1f}%",
+        )
+    console.print(combined_table)
+
     output_dir = Path(cfg.output_dir)
     timestamp = datetime.datetime.now().isoformat(timespec="seconds")
     if rows:
         append_csv_rows(output_dir / "sweep_results.csv", timestamp, rows)
-    (output_dir / "results.html").write_text(render_html_report(bf16_probe, rows, compile_stages_line))
+    if combined_rows:
+        append_csv_rows(output_dir / "combined_benchmark.csv", timestamp, combined_rows)
+    (output_dir / "results.html").write_text(render_html_report(bf16_probe, rows, compile_stages_line, combined_rows))
     log.info(f"Results appended to <{output_dir / 'sweep_results.csv'}>.")
+    log.info(f"Combined benchmark appended to <{output_dir / 'combined_benchmark.csv'}>.")
     log.info(f"HTML report written to <{output_dir / 'results.html'}>.")
     log.info("Sweep completed. If any stage is in the 10-20% band, use AskUserQuestion before wiring "
               "the config -- see SKILL.md workflow step 7.")

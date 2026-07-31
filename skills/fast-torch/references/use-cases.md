@@ -106,3 +106,61 @@ anywhere, precision still `"32-true"`.
 handling — start fresh from `assets/compile_bf16_sweep.py`, no existing tool to extend.
 **Confirmed present in**: `JustDepth` (mid-migration to the family's Hydra/`tools/` shape at time of
 writing, no benchmark tooling yet).
+
+### Edge case: a top-level nn.Module child's own forward() is bypassed by manual per-child indexing
+
+**What it looks like**: a top-level `nn.Sequential`/`nn.ModuleList` child exists (`named_children()`
+finds it fine), but the parent model's `forward()` never calls it as a whole — instead it manually
+indexes `self.<attr>[i](x)` in a Python loop, e.g. `for i in range(self.n_blocks): x =
+self.graph_backbone[i](x)`. This differs from the plain "bound method, not an nn.Module child" case
+above: the attribute genuinely IS an `nn.Module` container, `named_children()` genuinely does find it
+— it's just never invoked as a single callable.
+**Handling**: a forward hook on the container attribute itself never fires (its own `__call__` is
+never invoked, only its children's are), so it silently measures nothing rather than erroring loudly
+— easy to miss unless you cross-check discovered stages against the actual `forward()` body per
+`stage-discovery.md`. Compiling and swapping back the container attribute as a whole also breaks
+`forward()`'s `[i]` indexing, since `torch.compile`'s `OptimizedModule` wrapper doesn't proxy
+`__getitem__`. Fixed via a `CONTAINER_CHILD_STAGES` mapping (name -> container attribute) in
+`assets/compile_bf16_sweep.py`: each child is hooked/compiled individually and rolled up into one
+logical stage name, and compiling reassigns each child in place
+(`container[i] = torch.compile(container[i])`) rather than replacing the container attribute.
+**Confirmed present in**: `JustDepth` (`graph_backbone`, an 8-block GNN stack built as
+`nn.Sequential(*[Seq(Grapher, FFN) for _ in range(n_blocks)])`, indexed manually in `JustDepth.forward()`).
+
+### Edge case: hooking a module while it is also the current torch.compile target corrupts its timing
+
+**What it looks like**: `StageLatencyProbe`'s pre/post forward hooks are registered on a module, and
+that same module is (or becomes) the target of `torch.compile` for its own measurement pass. This
+isn't a per-repo structural quirk like the others above — it's a defect in the sweep tool's own
+measurement mechanism, triggered by ANY stage on ANY repo the instant it's both hooked and compiled.
+**Handling**: `OptimizedModule.__call__` invokes the wrapped module's `__call__` (hooks included), so
+Dynamo traces the hook's own side effects (a Python list append whose length changes every call, a
+`torch.cuda.Event.elapsed_time()` call) as part of the compiled graph. Observed as silently wrong
+numbers (garbage negative-percent "speedups") for most stages, and an outright crash
+(`RuntimeError: expected other to be a torch.Event object`, after Dynamo hit its recompile limit on
+the changing-length guard) for a `CONTAINER_CHILD_STAGES` stage compiled as several children at once.
+Fixed in `assets/compile_bf16_sweep.py`: `StageLatencyProbe` takes an `exclude` set, and the stage
+currently wrapped in `torch.compile` is always excluded from hooking — its compiled latency is
+derived instead from the whole-model wall-clock delta (CUDA events wrapping the entire `model(batch)`
+call from outside any hook), which is unaffected by what's compiled inside. This applies to every
+stage now, not just bound-method ones as an earlier draft assumed.
+**Confirmed present in**: `JustDepth` (first real GPU run of the hook-based sweep design; see
+`case-studies.md`'s 2026-07-30 entry — the prior code-review-only entry had flagged this as an
+unverified risk, not yet a confirmed bug).
+
+### Edge case: a per-module hook-registering profiler (thop, FLOPs/param counters) breaks on a partially-compiled model
+
+**What it looks like**: a repo's eval/benchmark entrypoint calls something like `thop.profile(model,
+inputs=...)` to report FLOPs/params, walking `model.modules()` and registering a buffer (e.g.
+`total_ops`) on every submodule. If `torch.compile` has already been applied to any submodule by this
+point, that submodule is enumerated twice by `model.modules()` — once as itself, once via the
+`OptimizedModule` wrapper's attribute delegation to `_orig_mod` — so the second registration attempt
+raises (`KeyError: "attribute 'total_ops' already exists"`, or equivalent for other buffer-registering
+tools).
+**Handling**: not a `StageLatencyProbe`/sweep-tool issue at all — this is a target-repo production
+code ordering issue. Apply `torch.compile` strictly after any such profiling call, not merely after
+checkpoint loading (the two orderings usually coincide, but don't have to — checkpoint load, FLOPs
+profile, THEN compile, in that order). See `hydra-wiring.md`'s ordering rule, now generalized beyond
+just checkpoint loading.
+**Confirmed present in**: `JustDepth` (`tools/eval.py`'s `thop.profile(net, ...)` call, positioned
+between checkpoint loading and the eval loop).

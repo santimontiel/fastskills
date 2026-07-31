@@ -52,6 +52,39 @@ add it explicitly. Don't skip this step just because it's manual — on `gcarpre
 `camera_unprojection` and `gaussian_evolution` were both real, measured wins (part of the seven-stage
 default), and neither would show up in a `named_children()`-only sweep.
 
+## What also isn't automatic: a container child whose own forward() is bypassed
+
+Some top-level `nn.Module` children ARE found by `named_children()` — no discovery gap there — but
+are never invoked as a whole by the model's own `forward()`. Confirmed real example: `JustDepth`'s
+`graph_backbone`, an `nn.Sequential(*[Seq(Grapher, FFN) for _ in range(n_blocks)])` stack, called as:
+
+```python
+for i in range(self.n_blocks):
+    x = self.graph_backbone[i](x)
+```
+
+`self.graph_backbone` itself (the container) never has `__call__` invoked on it — only its indexed
+children do. This breaks both halves of the normal hook-based approach:
+- A forward hook registered on `model.graph_backbone` never fires, so it silently measures nothing
+  (not an error — easy to miss unless you cross-check discovered stages against the actual
+  `forward()` body, not just `named_children()`'s output).
+- Compiling and swapping back `model.graph_backbone` as a single attribute would break `forward()`'s
+  `self.graph_backbone[i]` indexing, since `torch.compile`'s `OptimizedModule` wrapper doesn't proxy
+  `__getitem__`.
+
+**Handled by treating it as a multi-module stage**, declared in `CONTAINER_CHILD_STAGES` (name →
+container attribute name):
+
+```python
+CONTAINER_CHILD_STAGES = {"graph_backbone": "graph_backbone"}
+```
+
+`discover_stage_modules()` expands this into `[container[i] for i in range(len(container))]` — every
+child hooked individually, rolled up into one logical stage name (their latencies summed per forward
+pass, since each child is invoked exactly once). `compiled_stage()` compiles and reassigns each child
+in place (`container[i] = torch.compile(container[i])`) rather than replacing the container attribute
+itself. See `use-cases.md`'s matching catalog entry and `case-studies.md`'s 2026-07-30 JustDepth entry.
+
 ## Known-hostile stages: flag before running, don't discover by crashing blind
 
 Every lineage repo's benchmark tool pre-declares which stages wrap vendored CUDA ops with no

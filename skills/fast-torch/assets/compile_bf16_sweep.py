@@ -284,6 +284,15 @@ def _iter_tensors(obj):
     Several real stages (e.g. an image encoder) return a dict of named tensors, not a bare tensor or
     a plain tuple -- a hook that only checks isinstance(output, Tensor) silently observes nothing for
     those and would falsely report full coverage. Walk the whole structure instead of assuming a shape.
+
+    Also duck-types a sparse-tensor-library container (e.g. spconv.pytorch.SparseConvTensor, or any
+    similarly-shaped wrapper from another sparse/graph library) via a `.features` + `.indices`
+    attribute pair, rather than isinstance-checking a specific library so this doesn't require
+    importing it. Without this, a stage returning such an object (confirmed real: a Sparse UNet
+    decoder whose tail conv is nn.Identity, so the raw SparseConvTensor passes through unchanged)
+    would silently report "not observed" from the bf16 probe -- false "no problem found" confidence,
+    the same failure shape as the dict-output case above but for a container type that fix doesn't
+    cover. See references/use-cases.md.
     """
     if isinstance(obj, torch.Tensor):
         yield obj
@@ -293,6 +302,8 @@ def _iter_tensors(obj):
     elif isinstance(obj, (list, tuple)):
         for v in obj:
             yield from _iter_tensors(v)
+    elif hasattr(obj, "features") and hasattr(obj, "indices"):
+        yield from _iter_tensors(obj.features)
 
 
 def probe_bf16_compatibility(model: nn.Module, stage_modules: dict[str, list[nn.Module]], batch: dict) -> dict[str, str]:

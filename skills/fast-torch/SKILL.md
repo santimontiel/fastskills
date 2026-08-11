@@ -103,7 +103,12 @@ what's automatic and what still needs a human/Claude to fill in.
    fix — read the actual exception/NaN pattern to pick the right one from
    `references/precision-escape-hatches.md` (a whole-submodule `autocast(enabled=False)` wrap for
    "no bf16 kernel at all," vs. narrower explicit `.float()` casts for "this specific op needs
-   fp32 regardless of ambient autocast"). **This probe only exercises `forward()` — it does NOT catch
+   fp32 regardless of ambient autocast"). **Before running the probe, if a stage wraps a vendored
+   CUDA extension with visible source, grep its `.cu`/`.cpp` for `AT_DISPATCH_FLOATING_TYPES` (no
+   Half/BFloat16 support — predicts a hard crash under bf16 autocast before you've run anything) vs.
+   `AT_DISPATCH_FLOATING_TYPES_AND_HALF`/`_AND2(Half, BFloat16)`** — a free, definitive pre-check
+   confirmed to exactly predict a real crash (`bevpredformer-radar`'s deformable-attention kernel,
+   see `references/use-cases.md`). **This probe only exercises `forward()` — it does NOT catch
    a recurring, confirmed-multiple-times class of bug where a training loop's own preview/logging
    code calls `.cpu().numpy()` on a bf16 model output** (NumPy has no bfloat16 dtype at all; hard
    crash, not a NaN). Only a real training run (step 9) catches this — see

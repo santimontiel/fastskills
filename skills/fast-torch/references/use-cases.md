@@ -148,6 +148,78 @@ stage now, not just bound-method ones as an earlier draft assumed.
 `case-studies.md`'s 2026-07-30 entry — the prior code-review-only entry had flagged this as an
 unverified risk, not yet a confirmed bug).
 
+### Edge case: a stage's `forward()` returns a custom tensor-container type, not a bare Tensor/dict/list/tuple
+
+**What it looks like**: a sparse-tensor library (`spconv.pytorch.SparseConvTensor`, or similar wrapper
+types from other sparse/graph libraries) is returned directly from a stage's `forward()`. It is not a
+`Tensor`, `dict`, `list`, or `tuple` — it's a custom object exposing the real dense data via an
+attribute (`.features` for `SparseConvTensor`, alongside `.indices` describing sparse coordinates).
+**Handling**: the base `_iter_tensors()` walk (Tensor/dict/list/tuple only) silently skips it — the
+bf16 probe then reports `"not observed (no tensor output captured)"` for that stage, which reads as
+"nothing to worry about" but actually means **the probe never checked anything**, the same false-
+confidence failure mode as the dict-output edge case above, just for a container type that fix doesn't
+cover. `_iter_tensors()` in `assets/compile_bf16_sweep.py` now also recognizes any object exposing
+both `.features` and `.indices` (duck-typed, not an `isinstance(SparseConvTensor)` check, so it covers
+other sparse-tensor libraries with the same shape without importing them) and recurses into
+`.features`. If a target repo uses a different custom output container with neither of these
+attributes, extend the same duck-typed pattern rather than hardcoding an import for that library.
+**Confirmed present in**: `bevpredformer-radar` (`decoder`, a `SparseUNet` whose default
+`tail_conv = nn.Identity()` means the raw `SparseConvTensor` passes through unchanged as the stage's
+output — without this fix, `decoder`'s bf16 probe result would have been "not observed", not "ok").
+
+### Edge case: a vendored CUDA extension's own source directly answers the bf16-support question, without running anything
+
+**What it looks like**: a Pattern A candidate (a vendored/custom CUDA op, per
+`precision-escape-hatches.md`) whose actual dtype support is ambiguous from behavior alone — does it
+need an escape hatch or not? Running the probe answers this, but for a vendored extension with visible
+source, the answer is often already written down in the kernel's own dispatch macro.
+**Handling**: grep the extension's `.cu`/`.cpp` source for PyTorch's dispatch macros before assuming
+either way. `AT_DISPATCH_FLOATING_TYPES` (float/double only) means bf16/fp16 will hard-crash the
+instant an enclosing autocast region feeds it a bf16 tensor — a **definitive, before-you-run-anything**
+signal to add a Pattern A escape hatch preemptively. `AT_DISPATCH_FLOATING_TYPES_AND_HALF` or
+`AT_DISPATCH_FLOATING_TYPES_AND2(Half, BFloat16)` means the kernel was written with reduced-precision
+support in mind (though still worth probe-confirming, since dispatch support doesn't guarantee
+numerical correctness). This doesn't replace running the bf16 probe — it's a fast, free pre-check that
+turns "probe shows a crash, now go read the C++ to understand why" into "already know why, applying
+the fix before the first run."
+**Confirmed present in**: `bevpredformer-radar` (`ops/defattn/src/cuda/ms_deform_attn_cuda.cu`'s
+`AT_DISPATCH_FLOATING_TYPES` call conclusively predicted the `view_transform` bf16 crash before the
+probe was ever run — matched exactly: `NotImplementedError: "ms_deform_attn_forward_cuda" not
+implemented for 'BFloat16'`).
+
+### Edge case: a stage wrapping a vendored CUDA/sparse-conv op is compile-hostile for a *different* reason than expected (dynamic recompilation, not missing bf16 support)
+
+**What it looks like**: prior lineage experience (PTv3/spconv radar encoders in `tinycar-dev`/
+`gcarpred-dev`) established "spconv-based stage → assume no bf16 support, assume compile-hostile" as
+a single combined pattern. A new target's own spconv usage can decouple these: bf16 support and
+compile-friendliness are two independent questions, and a stage can fail one without the other.
+**Handling**: don't assume — probe both independently. In this case the stage passed the bf16 probe
+completely cleanly (no escape hatch needed at all) but was still a severe, high-variance regression
+under `torch.compile` (fp32: -56.4%/-84.8% across two variants) because its data-dependent output
+shape (`num_activate_out`, computed from `torch.nonzero()` on a per-batch mask) makes
+`torch._dynamo` hit its recompile limit repeatedly — a compile-graph-management problem, not a
+numerical-precision one. Pre-declaring it in `KNOWN_COMPILE_HOSTILE_STAGES` was still the right call
+(it correctly predicted "don't compile this"), just for a different underlying mechanism than the
+label's usual PTv3 association implies — don't let a `KNOWN_COMPILE_HOSTILE_STAGES` entry's *reason*
+carry over unexamined from a different repo's similar-looking stage.
+**Confirmed present in**: `bevpredformer-radar` (`decoder`, `SparseUNet`).
+
+### Edge case: a sibling repo's blanket "exclude the radar/point-cloud encoder from compile" precedent doesn't automatically transfer
+
+**What it looks like**: every prior sibling repo in this lineage with a point-cloud/radar encoder
+(`tinycar-dev`, `gcarpred-dev` via PTv3; `fiery-radar`, `powerbev-radar` via their own pillar
+encoders) excludes it from `compile_stages` by convention/config default, reasoning that variable
+point counts per batch produce a new shape almost every step, defeating compilation.
+**Handling**: this reasoning is real but doesn't universally generalize to "never compile a radar/
+point-cloud encoder" — it depends on how much of the encoder's *own* internal shape is actually
+data-dependent vs. fixed once bucketed onto a dense grid. A radar encoder that pillar-buckets points
+onto a fixed-size dense BEV grid early (before any further compute) can have very little
+data-dependent shape downstream of that point, even though its *input* point count varies — measure
+it rather than pattern-matching on "it's a radar encoder, sibling repos exclude theirs."
+**Confirmed present in**: `bevpredformer-radar` (`radar_encoder`, a `FastRadarPillarNet` explicitly
+engineered — per its own module docstring — to avoid `torch_scatter`/spconv specifically to stay
+compile-friendly; measured +31.4% (±6.8), a clean win, correctly NOT pre-excluded).
+
 ### Edge case: a per-module hook-registering profiler (thop, FLOPs/param counters) breaks on a partially-compiled model
 
 **What it looks like**: a repo's eval/benchmark entrypoint calls something like `thop.profile(model,

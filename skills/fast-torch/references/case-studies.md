@@ -277,3 +277,85 @@ supervision. Worth a note here in case a future invocation is asked for the same
 critical" request again: the pattern (background bash loop, one Bash `run_in_background` call
 wrapping both the training launch and the monitor loop so there's a single completion notification)
 worked cleanly and needs no skill-level change, just re-deriving the same script.
+
+### 2026-08-10/11 — bevpredformer-radar (two model variants, first BEVFormer-style deformable-attention target)
+
+**Target repo state**: no compile/bf16 prior art at all (see `use-cases.md`'s existing entry for this
+bucket). Two model variants share most of the network: `BEVPredFormerPredictor` (camera-only, has a
+real checkpoint with a documented IoU/VPQ baseline) and `BEVPredFormerPredictorCamRadar` (adds a
+`radar_encoder`/`fuser` pair, no checkpoint yet — random-init only). Both swept separately
+(`model=BEVPredFormerPredictorCamRadar with_radar=True` selects the second). Also the first target in
+this lineage with **no bound-method stages and no manually-indexed top-level containers at all** —
+every stage in `forward()` is a genuine `nn.Module.__call__`, so `EXTRA_METHOD_STAGES` and
+`CONTAINER_CHILD_STAGES` stayed empty. (One level *inside* `DefAttnVT.forward()`, several
+`nn.ModuleList`s *are* manually indexed in a Python loop — the classic `CONTAINER_CHILD_STAGES`
+shape — but this doesn't block treating `view_transform` as one atomic top-level stage, since its own
+`forward()` is what gets called; only relevant if finer per-layer granularity is ever wanted later.)
+
+**Escape hatches needed**: `view_transform` (`DefAttnVT`, wrapping `MSDeformAttn`/`MSDeformAttn3D`, a
+vendored CUDA extension at `ops/defattn/`) hard-crashed under bf16 autocast:
+`NotImplementedError: "ms_deform_attn_forward_cuda" not implemented for 'BFloat16'`. **Confirmed via
+the CUDA source itself before even running anything** — `ops/defattn/src/cuda/ms_deform_attn_cuda.cu`
+dispatches via `AT_DISPATCH_FLOATING_TYPES` (float/double only, no `_AND_HALF`/`BFloat16` variant).
+Fixed with Pattern A, scoped tightly: `torch.autocast(device_type=..., enabled=False)` wrapping just
+the `self.deformable_attention(...)` call inside `SADefnAttn.forward`/`CADefnAttn.forward`
+(`bevpredformer/models/layers/attention.py`), with explicit `.float()` casts on every tensor argument
+passed in (disabling autocast alone does NOT retroactively un-cast tensors already computed as bf16
+upstream — the input tensors themselves needed casting too, not just the ambient context). One
+follow-on dtype fix was needed in `CADefnAttn`: the fp32 output had to be cast back to the ambient
+(possibly bf16) dtype before an in-place `+=` into a pre-allocated `bf16` accumulator, or it raises
+a dtype-mismatch error — `SADefnAttn` didn't need this since its own residual add uses `+` (out-of-place,
+happy to mix dtypes) not `+=`. **Verified by re-running the probe after the fix**: `view_transform`
+went from `crashed` to `ok`, no NaN. `decoder` (`SparseUNet`, spconv-based) needed **no escape hatch
+at all** — passed the bf16 probe cleanly despite being flagged `KNOWN_COMPILE_HOSTILE_STAGES` — see
+the new use-cases.md entry below; this genuinely surprised the "spconv/PTv3 = no bf16" assumption
+carried over from `tinycar-dev`/`gcarpred-dev`, and turned out to be a *compile*-only problem, not a
+precision one.
+
+**Decisions made** (clean, uncontended runs — see the methodological finding below for why "clean" is
+load-bearing here): both variants agree on `backbone` (+47.2%/+45.0% fp32) and `neck`
+(+20.6%/+21.6% fp32) as consistent, strong, low-variance wins — shipped as the shared default
+(`compile_stages: "backbone,neck"` in `configs/train.yaml`/`configs/val.yaml`). `decoder` is a
+consistent, severe regression in both (-56.4%/-84.8%, high variance from constant
+`torch._dynamo` recompilation on spconv's data-dependent sparse shapes) — excluded. `projector`,
+`query_gen`, `view_transform` are consistent regressions in both (cheap/small ops — compile dispatch
+overhead exceeds any fusion gain) — excluded, no `AskUserQuestion` needed, unambiguous. `heads`
+(+10.8%/+8.3%) and `temporal` (+12.0%/+9.7%) landed right at the ask-band boundary in BOTH variants,
+consistently, with tight std (not noise) — asked via `AskUserQuestion`, user chose to exclude both
+(marginal gain not worth added compile/startup latency). CAMRADAR-only: `radar_encoder` is a clean
+win (+31.4%, ±6.8) — notably **not** pre-excluded the way every sibling repo's own radar encoder is
+(see `use-cases.md`'s new entry below), and the sweep confirmed it was right not to assume; `fuser`
+is a small, consistent regression (-6.1%) — excluded. CAMRADAR override documented in the config
+comment: `compile_stages=backbone\,neck\,radar_encoder`. Combined whole-model benchmark (final,
+shipped stage set, camera-only): +25.1% fp32 / +21.0% bf16.
+
+**New methodological finding, not yet in any reference doc — GPU contention from an unrelated
+concurrent job corrupts the sweep's timing numbers, even though it doesn't affect an accuracy-only
+job's correctness**: a first pass at the camera-only sweep was run on a shared GPU already hosting
+two long-running sibling-project containers, producing per-stage speedups as absurd as
+`query_gen: +22824.5% (±26349.4)` and `neck: +1124.0% (±1497.9)` — several stages later confirmed
+(clean re-run) to actually be **regressions**. Root cause: `run_sweep`'s per-stage "compiled" number
+is a *derived delta* (`compiled_whole_ms − eager_whole_ms + eager_stage_ms`, see
+`StageLatencyProbe`'s docstring), and for a cheap/fast stage this delta is the difference of two large,
+noisy numbers — when a concurrent process is stealing GPU cycles unpredictably, that noise floor can
+dwarf the tiny stage's true signal, producing nonsense percentages with the sign essentially random.
+A **second**, self-inflicted instance of the same problem happened mid-session: the CAMRADAR sweep was
+accidentally launched concurrently with an unrelated `tools/val.py` accuracy-comparison run (val.py's
+own *output* — IoU/VPQ — is unaffected by contention, since accuracy is deterministic regardless of
+wall-clock speed, but the **sweep's** output is nothing but wall-clock timing, so it was corrupted
+by the very same mechanism). **Both times, the fix was the same: kill everything else on the GPU and
+re-run the sweep alone.** `run_sweep_repeated`'s existing `num_repeats` averaging does NOT fix this —
+it did nothing to save the first contended run, since all 3 repeats were contended identically (not
+independent noise that averages out, but a shared confound biasing every repeat the same direction).
+**Practical rule going forward**: before trusting sweep numbers, `nvidia-smi`/`docker ps` should be
+used to confirm nothing else is running on the target GPU — not just once before starting, but ideally
+spot-checked again after, since another process can start mid-sweep. The combined benchmark is
+somewhat more robust to brief contention (it's 1-3 direct measurements, not a chain of deltas) but is
+not immune either — treat it with the same "was anything else running" scrutiny.
+
+**Follow-ups**: neither variant's `compile_stages` default was tested with DDP (`trainer.devices>1`)
+— only `trainer.devices=1` was exercised, matching this repo's own single-GPU verification convention
+(`num_workers` capped at 2). The CAMRADAR variant's `compile_stages` recommendation is based on
+random-init weights only (no checkpoint exists yet) — its accuracy-comparison leg of step 9 could only
+check "loss stays finite, roughly consistent with an earlier uncompiled smoke-test run," not a real
+IoU/VPQ baseline; re-verify once a CAMRADAR checkpoint exists.

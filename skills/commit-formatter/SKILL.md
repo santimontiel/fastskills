@@ -148,3 +148,5 @@ the main tables/protocol above instead if it generalizes past one case.
 ## Learned
 
 <!-- One line per finding. Prune once folded into the sections above. -->
+- The `<emoji> <type>: ` prefix costs ~12 chars, so the ≤50 target leaves ~38 for the description — budget for it rather than trimming after the fact.
+- When splitting one large change into per-feature commits, a rename/move commit must stage the *deletions* of the old paths too (`git add -A <old> <new>`), or the intermediate tree carries both copies and the history is unbuildable.

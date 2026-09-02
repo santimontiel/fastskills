@@ -148,7 +148,7 @@ container started without `-e WANDB_API_KEY` will not have it even when the host
 missing, either export it into the container or queue with `logger=csv` rather than discovering it
 overnight.
 
-**Confirmed in**: tinycar-dev (2026-08-08); gaussiancarpred-dev (2026-08-10).
+**Confirmed in**: tinycar-dev (2026-08-08); gaussiancarpred-dev (2026-08-10, 2026-08-12 -- WANDB_API_KEY absent inside an agent-started container, queued with logger=csv).
 
 ---
 
@@ -287,3 +287,179 @@ actually needs it before assuming — here a gated HuggingFace backbone made mod
 with a 401 long before any data was touched.
 
 **Confirmed in**: tinycar-dev (2026-08-08).
+
+---
+
+## `torch.utils.checkpoint` and `torch.compile` on the same submodule are incompatible
+
+**Situation**: a memory-saving gradient-checkpoint flag wraps a block that also appears in
+`compile_stages`. Training crashes several minutes in — *after* the compile warmup, i.e. long
+after the smoke would have looked fine if the smoke had skipped compile — with:
+
+```
+torch.utils.checkpoint.CheckpointError: A different number of tensors was saved during the
+original forward and recomputation.
+```
+
+The compiled module saves a different number of tensors on the recompute than on the original
+forward, so the checkpoint's bookkeeping fails. It is not a tolerance or a flakiness issue and it
+does not depend on the model.
+
+**What to do**: drop just the checkpointed block from `compile_stages` (here
+`compile_stages='image_encoder,camera_unprojection'`, i.e. everything except `decoder`) —
+confirmed to run clean. Better, add an explicit pre-flight in the entrypoint that raises with the
+fix in the message when the two are combined, so it fails in the first second rather than after
+warmup. Note the ordering trap this creates for the *skill*: a smoke run with
+`compile_stages=none` passes and tells you nothing, so smoke every queued job at the **production
+compile setting**, not a cheaper one.
+
+**Confirmed in**: gaussiancarpred-dev (2026-08-12), `task=prediction`,
+`module.model.checkpoint_decode=True` + compiled `decoder`, PyTorch 2.8.0.
+
+---
+
+## Hydra comma-quoting, reconfirmed on a second project
+
+The "Hydra comma-separated list overrides need quoting" entry above also applies to
+`compile_stages` (plural) in gaussiancarpred-dev, 2026-08-12: `compile_stages=a,b` raises
+"Ambiguous value for argument", and inside `docker exec ... bash -c "..."` it needs
+`compile_stages=\'a,b\'`. Same quirk, different key name from tinycar-dev's `compile_stage`
+(singular) — check the exact key per entrypoint, as that entry already warns.
+
+---
+
+## A horizon/multi-output task moves the memory ceiling again, and the obvious knob is the wrong one
+
+**Situation**: extending a multi-frame *input* task to multiple *output* frames (BEV instance
+prediction: 3 input frames in, 5 predicted frames out). The instinct is to shrink the
+transformer's query budget, since the per-query mask tensor `(B, Q, T_out, H, W)` looks like the
+dominant term.
+
+**What to do**: measure the decomposition before choosing a knob. On gaussiancarpred-dev
+(RTX 5090, 32 GB, bf16, one forward+backward at `batch_size=1`): `T_out=5` peaked at 23.91 GiB,
+`T_out=1` at 15.37 GiB, so the horizon costs ~2.1 GiB per output frame over a ~15.4 GiB floor that
+is the image encoder at 18 views. Halving `num_queries` (100 → 50) saved **2%**; gradient
+checkpointing the fuse+decode block saved 7%; disabling the whole motion predictor saved 0.3%.
+`batch_size=2` OOMed regardless. So the only real levers are the horizon length itself and the
+input frame count — report the measured table rather than a plausible-sounding knob order.
+
+**Confirmed in**: gaussiancarpred-dev (2026-08-12), RTX 5090 32 GB.
+
+---
+
+## "N epochs per run" on a multi-config sweep: quote the total before writing the script
+
+**Situation**: the user asks for a hyperparameter search at a fixed epoch count per run ("10
+epochs per run"), phrased as a property of one run rather than of the queue. The number of
+configs multiplies it, and on a single consumer GPU forced to `batch_size=1` there is no
+parallelism to absorb it.
+
+**What to do**: measure both rates (train *and* val separately — val can be 2x faster per clip
+than train, so folding them into one number misestimates by hours over a long queue), multiply
+out, and put the total in front of the user *as a decision* before writing any script. On
+gaussiancarpred-dev: 2.28 it/s train over 23930 clips = 2.92 h/epoch, 5.43 it/s val over 5119 =
+0.26 h/epoch, so 8 configs x 10 epochs = **254 h / 10.6 days**. Offering the arithmetic alongside
+three or four costed alternatives (staged screen-then-finalists; fewer configs; fewer epochs) got
+a decision in one exchange — the user picked 8 x 3 epochs / 76 h. Silently shrinking the request
+would have been worse than asking, and so would have been queueing 10.6 days of GPU.
+
+**Confirmed in**: gaussiancarpred-dev (2026-08-12), RTX 5090 32 GB, `task=prediction`.
+
+---
+
+## Editing a source file the *running* queue imports
+
+**Situation**: the queue's stages are `docker exec ... uv run tools/train.py` against a
+bind-mounted repo. Editing any module those runs import — not the queue script, the *source* —
+means later stages execute different code than earlier ones, silently.
+
+**What to do**: treat the mounted source tree as frozen for the queue's duration, the same way
+the skill already treats the running queue script. This is stricter than it sounds for a smoke
+queue in particular, whose whole value is that all N stages tested one revision. If an edit
+cannot wait, kill the queue rather than let it straddle two versions. On gaussiancarpred-dev an
+import line was added ~40 s after a 7-stage smoke queue started and was reverted before stage 2
+began; the tell was that stage 1 had already logged `exit 0` against the old file.
+
+**Confirmed in**: gaussiancarpred-dev (2026-08-12).
+
+---
+
+## A project's `--cfg job --resolve` dry-run can fail on its own custom resolvers
+
+**Situation**: the config-only pre-flight (`tools/train.py <overrides> --cfg job --resolve`) dies with
+`UnsupportedInterpolationType: Unsupported interpolation type mult` — nothing to do with the overrides
+being tested. The project registers custom OmegaConf resolvers (`mult`, `add`, `last_token`) from
+inside its `@hydra.main` function body, and `--cfg` prints the config *without* ever entering that
+function, so the resolvers are never registered.
+
+**What to do**: drop `--resolve` and run plain `--cfg job`. It still parses and applies the overrides,
+so it catches the thing this gate is for — a typo'd or non-existent override key — and simply prints
+interpolations unexpanded. If genuinely resolved values are needed (checking that a task's
+`camera_frames` actually reaches `module.model`), write a throwaway script that calls the project's
+`register_new_resolvers()` and then `hydra.compose(...)`; also call
+`HydraConfig.instance().set_config(cfg)` or any `${hydra:runtime.choices.*}` interpolation (common in
+logger configs) raises `HydraConfig was not set`.
+
+**Confirmed in**: gaussiancarpred-dev (2026-08-19).
+
+---
+
+## Smoke the eval/resume stage too — a `torch.compile` checkpoint won't reload into an eager net
+
+**Situation**: the train stage sets `compile_stages`, so Lightning saves the wrapped submodules'
+keys with a `_orig_mod.` infix (`feature_extractor.bev_projections.0._orig_mod.reduce.0.weight`).
+The queue's *eval* stage (and any resume) loads into an un-compiled network and dies with
+`checkpoint did not match the network: N missing, N unexpected` — discovered only after training
+already spent the night, because the smoke tested train but not eval-of-the-trained-ckpt.
+
+**What to do**: smoke the eval/resume stage against a *real* mid-training checkpoint, not just the
+published one. Fix belongs in the project's checkpoint loader: strip `_orig_mod.` from every key
+before `load_state_dict` (a compile wrapper artifact, not a real parameter name). Re-check the
+project's forward/numerics anchor after touching that loader.
+
+**Confirmed in**: rapidradar-dev (2026-08-31) — `compile_stages="voxel_encoder,bev_projections"`
+in `configs/train.yaml`; added `strip_compile_prefix` to `rapidradar/utils/checkpoint.py`.
+
+---
+
+## A prerequisite data artifact with no in-repo builder — port it from the named upstream repo
+
+**Situation**: the data-prep entrypoint (`tools/create_data.py`) needs a per-sequence artifact
+(`map_clean.npy`, an aggregated static map) that nothing in the repo produces — the README just
+says "follow the instructions in the [upstream] repository". Raw SemanticKITTI was downloaded but
+is not training-ready, so no training can run until the artifact exists.
+
+**What to do**: find the upstream script (here LiDiff's `lidiff/map_from_scans.py`), port it into
+`tools/` dropping deps the repo deliberately removed (MinkowskiEngine → the repo's own
+`torch.unique`-based `efficient_voxel_downsample`), and smoke it on the *smallest* sequence
+(seq 04, 271 frames) before the full 11-sequence run. Write a `dev/verify_dataprep.py` that checks
+the obvious failure modes (empty/NaN, wrong shape, map bbox not covering the trajectory) since
+there is no upstream reference to diff against. Also: `configs/rapidradar.yaml` (the flat config
+`create_data.py` and `model.py` default to) was missing entirely — recreate it from the upstream
+`configs/rapidlidar.yaml` in the init commit.
+
+**Confirmed in**: rapidradar-dev (2026-08-31) — added `tools/build_maps.py`,
+`dev/verify_dataprep.py`, `configs/rapidradar.yaml`; ~20 min maps + ~77 min gt/input for 23k
+frames, ~60 GB. Container started detached (`sleep infinity`, `--restart unless-stopped`) because
+`make run` is interactive-only. Dated one-shot cron line fired cleanly on this host (Ubuntu,
+`cron` active, no `at`).
+
+---
+
+## An unrelated container can be holding most of the VRAM — check processes, not just free memory
+
+**Situation**: pre-flight `nvidia-smi` shows plenty of total VRAM, but gates and smoke runs OOM at
+implausibly small allocations ("tried to allocate 782 MiB ... this process has 5.95 GiB in use"). A
+long-lived unrelated container — here an LLM inference server, `llama-cpp-server`, up 45 hours and
+holding 25.7 GiB of a 32 GB card — was the real ceiling.
+
+**What to do**: in the idle-state check, run `nvidia-smi --query-compute-apps=pid,process_name,used_memory
+--format=csv` alongside the memory query. A free-memory number alone reads as "6 GiB free, fine" when the
+real story is "one process owns 79% of the card". The tell is an OOM whose *own* process usage is small
+relative to the card. Do not stop another container without asking — it is someone's running service —
+but say plainly that the two workloads cannot coexist when their peaks sum past the card, and let the
+user choose. Restart it with `docker start <name>` afterwards; a stopped (not removed) container keeps
+its config.
+
+**Confirmed in**: gaussiancarpred-dev (2026-08-19), RTX 5090 32 GB — 25.7 GiB llama-cpp-server vs a
+19.0 GiB training peak, so the pair never fit and the training queue required the server down.

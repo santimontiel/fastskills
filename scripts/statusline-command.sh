@@ -2,6 +2,12 @@
 input=$(cat)
 
 model=$(echo "$input" | jq -r '.model.display_name')
+effort=$(echo "$input" | jq -r '.effort.level // empty')
+if [ -n "$effort" ]; then
+    model_label="$model · $effort"
+else
+    model_label="$model"
+fi
 folder=$(basename "$(echo "$input" | jq -r '.workspace.current_dir')")
 five_hour=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty')
 seven_day=$(echo "$input" | jq -r '.rate_limits.seven_day.used_percentage // empty')
@@ -31,4 +37,4 @@ else
 fi
 
 printf "\033[01;32m🤖 %s\033[00m | \033[01;33m⏳ 5h: %s\033[00m | \033[00;35m📅 7d: %s\033[00m | \033[00;36m⏱️  %s\033[00m | \033[01;34m📁 %s\033[00m" \
-    "$model" "$usage_5h" "$usage_7d" "$session_time" "$folder"
+    "$model_label" "$usage_5h" "$usage_7d" "$session_time" "$folder"

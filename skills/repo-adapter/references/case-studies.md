@@ -55,3 +55,69 @@ intermediate tensors for NaN/Inf under the target precision mode before trusting
 results. This is why `references/verification.md`'s "check log scalars for NaN/Inf explicitly" step exists
 and why the fidelity-over-idiom principle in `SKILL.md` treats numeric-parity verification as non-optional,
 not a nice-to-have.
+
+### 2026-08-30 — rapidradar-dev (RapidLiDAR, ECCV 2026)
+
+**What was ported**: full adaptation of an externally-authored LiDAR scene-completion repo — uv +
+Docker + Slurm infra, package rename, a Hydra migration, a model/module/datamodule split, and two
+vendored CUDA extensions. `/fast-torch` ran in the same session on top of it. The repo was already
+Lightning-based, so the biggest risk in the workflow (porting a hand-rolled loop) did not apply; what
+it lacked was the `model.py`/`module.py` separation, since `RapidLiDAR` was one class holding the
+network, the steps, the optimizer and all three dataloaders.
+
+**Deviations from the tinycar-dev shape, and why**:
+- `bevpredformer-radar` was used as the reference repo, not tinycar-dev. It is the most recently
+  adapted sibling and — decisively — already vendors the *same* `MultiScaleDeformableAttention` CUDA
+  op this target needed. Copying tinycar-dev would have meant re-deriving that from scratch.
+- `faststart` was deliberately **not** used. Its installed template was verified in sync with its
+  repo, but every real repo in the lineage has hand-diverged from it (different dataset env-var
+  names, a `jupyter` target none of them kept, different slurm dataset-check logic), so it would have
+  produced the generic shape and then needed manual re-customization anyway.
+- The Python package was renamed `rapidlidar` → `rapidradar` at the user's request, but **class
+  names were kept** (`RapidLiDAR`, `RapidLiDARHubModel`) so the published HF model still loads.
+
+**Fidelity-vs-Pythonic tradeoffs made**:
+- `RapidLiDAR.__init__` still accepts `config_path`, `learning_rate` and `batch_size` even though it
+  is now a pure `nn.Module` with no use for them. The Hub's `config.json` stores the original
+  constructor kwargs and `from_pretrained` replays them, so dropping them breaks the published model
+  for everyone. **Check a published `config.json` before trimming any constructor signature.**
+- Preserved without "fixing": `set_float32_matmul_precision("medium")` (more aggressive than the
+  family's usual `"high"`); the validation dataloader's `shuffle=True`; a second, redundant-looking
+  `attn.init_weights()` call that actually consumes RNG and so changes every weight after it;
+  `train_refine.py` setting `gradient_clip_algorithm` with no `gradient_clip_val`, which disables
+  clipping entirely.
+- The ops' *Python frontend* was rewritten for readability at the user's request while the `.cu`/`.cpp`
+  sources stayed byte-for-byte upstream — a reasonable split of the "keep vendored code diffable"
+  rule, and safe only because numeric equivalence tests existed to back it.
+
+**New gotchas / nuances discovered**:
+- **A digest-based forward reference is the single highest-value artifact of a restructure.** Before
+  moving anything, a fixed-seed forward pass was captured as sha256 digests of every output
+  (`docs/forward_reference.json`, 12 KB — the raw tensors were ~400 MB). It then proved, bit-for-bit,
+  that the monolith→split and the bf16 escape hatch changed nothing. It needs no dataset, so it works
+  long before the one-epoch gate is reachable. Do this on every restructure.
+- **The upstream repo was not installable as written**, in two independent ways: `mmcv==2.2.0` only
+  via `mim` (hard-pinning torch 2.4.x), and a `ChamferDistancePytorch` git submodule the README told
+  you to init that **never existed** — no `.gitmodules`, no `[submodule]` in `.git/config`. Check
+  `git submodule status` early; a README is not evidence.
+- **Verify a vendored op three ways**, not one: against the upstream library's own pure-Python
+  reference (forward *and* backward), and by asserting the published checkpoint loads with 0
+  missing / 0 unexpected keys. The key check is what proves the swap is a genuine drop-in; the
+  reference check is what proves the kernel computes the same thing.
+- **A blanket `sed` rename needs auditing.** `\brapidlidar\b` correctly skipped
+  `rapidlidar_vox_0.3_best.pth` (underscore is a word char) — which was the *right* outcome, since
+  that is a published artifact name, not the package. It also silently missed
+  `rapidlidar_refine.yaml` for the same reason. Both directions need checking.
+- **`outputs/` in `.gitignore` matches at any depth**, so it also swallowed `dev/outputs/`, the
+  compile sweep's deliverable. Anchor run-output ignores with a leading slash.
+- **A broken host NVIDIA driver does not necessarily block GPU work.** `nvidia-smi` and
+  `nvidia-container-cli` both failed all session (kernel module vs userspace version mismatch), so no
+  *new* GPU container could start — but containers started *before* the upgrade kept working through
+  `docker exec`, holding the matching driver libs. That carried the entire session's GPU verification.
+  Flag loudly that stopping such a container is irreversible until the driver is fixed.
+
+**Follow-ups for next time**: the acceptance gate is **not** met — SemanticKITTI is not on the machine,
+so Baselines A/B and the one-epoch run are all outstanding and `docs/baseline.md` is a scaffold with
+empty rows. Everything below that bar (op equivalence, checkpoint key match, bit-identical
+restructure, a real 1-epoch fit + eval on synthetic data) is done. Also unverified: multi-GPU DDP,
+and the refinement path end-to-end (only its construction and forward were exercised).

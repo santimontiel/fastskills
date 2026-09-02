@@ -359,3 +359,66 @@ not immune either — treat it with the same "was anything else running" scrutin
 random-init weights only (no checkpoint exists yet) — its accuracy-comparison leg of step 9 could only
 check "loss stays finite, roughly consistent with an earlier uncompiled smoke-test run," not a real
 IoU/VPQ baseline; re-verify once a CAMRADAR checkpoint exists.
+
+### 2026-08-30 — rapidradar-dev (RapidLiDAR: LiDAR scene completion; first nested-stage target)
+
+**Target state**: no compile/bf16 prior art. Run in the same session as the `/repo-adapter` port, so
+the model had just been split into `model.py`/`module.py`. Hardware: RTX 5090 (sm_120), torch
+2.8.0+cu129. Note the host's NVIDIA driver was broken all session (kernel module 595.71.05 vs
+userspace 595.84, so `nvidia-container-cli` failed and no new GPU container could start); all GPU
+work ran via `docker exec` into a container started *before* the upgrade, which still held matching
+driver libs. Worth remembering as a workaround — and as a hazard, since stopping such a container is
+irreversible until the driver is fixed.
+
+**Measured numbers** (trained HF weights, batch 1, 18000 input points → 180000 queries, num_iters=30,
+num_repeats=3, idle GPU):
+
+| stage | fp32 | bf16 | decision |
+|---|---|---|---|
+| `voxel_encoder` | **+36.8%** (±0.8) | **+37.6%** (±0.6) | default |
+| `bev_projections` | **+36.8%** (±0.4) | **+46.2%** (±0.9) | default |
+| `fe_extract` (bound method) | +8.0% (±0.5) | +7.6% (±0.2) | skip |
+| `reconstruction` | +2.3% (±0.5) | +1.9% (±0.2) | skip |
+| `adaptive_init` | +1.8% (±4.7) | −3.8% (±6.1) | skip |
+| `feature_proj` | −0.1% (±1.4) | −1.9% (±0.5) | regression |
+| `bev_head` | **−39.6%** (±6.1) | **−48.8%** (±12.6) | regression |
+
+Nothing landed in the 10–20% ask band, so no `AskUserQuestion` was needed. Shipped
+`compile_stages: "voxel_encoder,bev_projections"`.
+
+Combined whole-model (both stages together, `mode="default"`): fp32 57.836→49.044 ms/sample
+(17.3→20.4 Hz, **+15.2%**); bf16 59.736→50.239 ms (16.7→19.9 Hz, +15.9%). Peak memory essentially
+unchanged (3590→3590 MB fp32). Note again how much smaller the honest whole-model number is than the
+per-stage figures suggest.
+
+**Escape hatches needed**: `reconstruction` and `refine_model`'s attention, both wrapping the
+vendored `MultiScaleDeformableAttention` kernel. Pattern A, exactly as `bevpredformer-radar`'s
+`view_transform`: the `.cu` source's `AT_DISPATCH_FLOATING_TYPES` predicted the crash before running
+anything, and the probe reproduced it verbatim (`NotImplementedError: "ms_deform_attn_forward_cuda"
+not implemented for 'BFloat16'`). Fixed with `torch.autocast(enabled=False)` plus explicit `.float()`
+on every tensor arg and a cast back to the caller's dtype. Verified the fix left fp32 **bit-identical**
+(sha256 digest of a fixed-seed forward pass), then re-probed: crashed → ok. The chamfer op is
+*also* fp32-only but needed nothing — its wrapper already casts `.float()` on the way in.
+
+**bf16 is measured but NOT adopted — the important finding.** After the hatch, bf16 runs clean with
+no NaN/Inf, and the sweep shows it is marginally *slower* whole-model than fp32 eager
+(59.7 vs 57.8 ms). More importantly, on **trained** weights a bf16 forward diverges from fp32 by a
+chamfer distance of **0.338 m** — the same order as the metric the model reports. Per-point
+differences (mean 23 m) are a red herring: the network emits an *unordered* cloud, so point identity
+is meaningless and only a set-level metric is informative. The lesson worth carrying: **for a model
+whose output is an unordered set, never judge bf16 fidelity by elementwise diff — use the task
+metric.** `trainer.precision` stays `"32-true"` pending a real eval against a dataset baseline.
+
+**Three template bugs found and fixed** (all upstreamed into `use-cases.md`): hooks leaked whenever a
+pass raised (`probe.remove()` outside a `finally`), producing a misleading first-failure several rows
+downstream; nested stages did not exclude their descendants from hooking; and my own first attempt at
+a bound-method-safe restore used `__dict__.pop` for *all* stages, which silently left `nn.Module`
+stages compiled (children live in `_modules`, not `__dict__`) so every later stage was measured
+against a partly-compiled model.
+
+**Follow-ups**: `bev_head`'s −40%/−49% is the largest regression seen in this lineage — attention over
+only 41×41=1681 tokens, so dispatch overhead swamps fusion. Worth checking whether a bigger BEV grid
+flips it. The refinement network was not swept at all: its gradient-checkpointing and chunking
+branches key off `self.training`/`requires_grad`/chunk size, so expect far more compile hostility.
+And every number here is on synthetic uniform input — re-run once SemanticKITTI is available, since
+`voxelize()`'s occupancy pattern (and hence the 3D UNet's cost) is data-dependent.

@@ -236,3 +236,56 @@ profile, THEN compile, in that order). See `hydra-wiring.md`'s ordering rule, no
 just checkpoint loading.
 **Confirmed present in**: `JustDepth` (`tools/eval.py`'s `thop.profile(net, ...)` call, positioned
 between checkpoint loading and the eval loop).
+
+### Edge case: a stage lives on a *child* module, reached only through the child's bound methods
+
+**What it looks like**: `named_children()` reports a submodule (`feature_extractor`) that looks like
+the obvious stage, but the parent's `forward()` never calls it as `self.feature_extractor(...)`. It
+calls `self.feature_extractor.extract(...)`, `.project_voxels_to_bev(...)`, `.interpolate(...)`
+instead. The child's own `forward()` is therefore never invoked. Two silent failures follow:
+
+  * a forward hook on that child fires **zero** times, so the probe reports "not observed" and the
+    latency probe measures nothing;
+  * `torch.compile(model.feature_extractor)` compiles a `forward()` that is never called — a
+    **silent no-op** that looks like "compiling this stage gave 0% speedup".
+
+This is distinct from entry #3 (bound methods on the *model root*): here the real units of work sit
+one level *below* a child, so neither `named_children()` nor a root-level `EXTRA_METHOD_STAGES`
+reaches them.
+
+**Handling**: address every stage by a **dotted attribute path** rather than a root attribute name
+(`feature_extractor.voxel_encoder`, `feature_extractor.bev_head`, …), resolved with a small
+`_resolve_attr(model, path) -> (parent, attr)` helper, and share that table with the training-time
+`apply_compile_stages` so the sweep can never drift from what actually gets compiled. Three
+consequences that all bit for real:
+
+  1. **Nested stages must exclude their descendants from hooking, not just themselves.** The
+     template already excludes the compiled stage from the probe (entry #10), but compiling an
+     *outer* stage makes Dynamo trace straight through its inner modules, hooks included. Surfaces
+     as `ValueError: Both events must be recorded before calculating elapsed time` on a stage that
+     is not the compile target. Fix: an explicit `STAGE_CONTAINS` map, and exclude
+     `{stage} | STAGE_CONTAINS[stage]`.
+  2. **Restoring an `nn.Module` stage must use `setattr`, never `__dict__.pop`.** `nn.Module`
+     overrides `__setattr__` to store children in `_modules`, so popping `__dict__` restores
+     nothing and silently leaves the stage compiled — every subsequent stage is then measured
+     against a partly-compiled model. The `__dict__.pop` path is correct *only* for genuine bound
+     methods, where `setattr` created a shadowing instance attribute over a class-level function.
+  3. **A bound-method stage cannot be bf16-probed or hook-timed.** Derive its bf16 status from the
+     stages it contains, and fall back to whole-pass wall clock for its latency (label it: that
+     number is a whole-model gain, not comparable with the per-stage rows).
+
+**Confirmed present in**: `rapidradar-dev` (`feature_extractor.{voxel_encoder,bev_head,bev_projections,feature_proj}`, plus `fe_extract` = the bound `FeatureExtractionModule.extract`).
+
+### Edge case: a failed pass leaks the latency probe's hooks
+
+**What it looks like**: a compile-hostile stage raises inside `_timed_pass`, which is a caught and
+expected outcome — but `probe.remove()` sits *after* the model call rather than in a `finally`, so
+the hooks stay attached. Every later pass then has several stale probes firing on the same modules,
+each popping from its own `_pending` list, and the sweep dies with
+`ValueError: Both events must be recorded before calculating elapsed time` on an unrelated stage
+several rows later. The reported first failure is not the real one.
+
+**Handling**: wrap the timed body in `try: … finally: probe.remove()`. This is a defect in the
+template itself, not repo-specific — it can fire on any repo where any stage crashes.
+
+**Confirmed present in**: `rapidradar-dev` (found while adapting the template; fix applies upstream).
